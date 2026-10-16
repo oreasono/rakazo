@@ -1,5 +1,11 @@
 # Rakazo
 
+> **Codex fork — foundation branch.** This fork is developing a Codex-owned runtime
+> with self-hosted Linux, macOS and Windows computers. The implementation plan and
+> acceptance gates are in [the fork architecture](docs/codex-fork.md). The product
+> runtime is still upstream Rakazo at this stage; the downloads and feature list
+> below describe upstream, not a released build of this fork.
+
 [![GitHub stars](https://img.shields.io/github/stars/elie222/rakazo?labelColor=black&style=for-the-badge&color=2563EB)](https://github.com/elie222/rakazo/stargazers)
 [![Discord](https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?labelColor=black&style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/RWwKa2Sn7h)
 [![Download on the App Store](https://img.shields.io/badge/App%20Store-Download%20for%20iPhone-black?labelColor=black&style=for-the-badge&logo=apple&logoColor=white)](https://apps.apple.com/app/rakazo/id6801531099)
