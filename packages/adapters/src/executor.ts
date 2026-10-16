@@ -5059,16 +5059,31 @@ export function createRunExecutor(deps: ExecutorDeps) {
                 },
               );
               if (observed.completion) {
-                const completion = observed.completion.then(async (final) => {
-                  clearPublishTimer();
-                  await appendComputerCommand({
-                    ...commandEvent,
-                    status: "done",
-                    exitCode: final.code,
-                    output: commandOutput(final, false).slice(-COMPUTER_COMMAND_OUTPUT_MAX_CHARS),
-                  });
-                  return final;
-                });
+                const completion = observed.completion.then(
+                  async (final) => {
+                    clearPublishTimer();
+                    await appendComputerCommand({
+                      ...commandEvent,
+                      status: "done",
+                      exitCode: final.code,
+                      output: commandOutput(final, false).slice(-COMPUTER_COMMAND_OUTPUT_MAX_CHARS),
+                    });
+                    return final;
+                  },
+                  async (error: unknown) => {
+                    clearPublishTimer();
+                    await appendComputerCommand({
+                      ...commandEvent,
+                      status: "done",
+                      exitCode: 1,
+                      output: redactSecrets(
+                        error instanceof Error ? error.message : "command failed",
+                        runSecrets,
+                      ).slice(-COMPUTER_COMMAND_OUTPUT_MAX_CHARS),
+                    });
+                    throw error;
+                  },
+                );
                 void completion.catch(() => undefined);
                 publishRunning(commandOutput(observed.result, true), true);
                 const returned = await finish({

@@ -3,14 +3,17 @@ import type {
   AutoReviewProvider,
   ConnectorCall,
   ConnectorTool,
+  ProcessEvent,
 } from "@rakazo/adapter-kit";
 import { MEMORY_REVISION_CONFLICT_ERROR } from "@rakazo/adapter-kit";
+import type { ComputerCommand } from "@rakazo/contracts";
 import type { ActionApprovalRule } from "@rakazo/core";
 import { approvalEffectKey, toolEffectIdempotencyKey } from "@rakazo/core/node/approval-effect-key";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { isApprovalPausedResult } from "./approval-effect.js";
 import { MAX_SHARED_MEMORY_CHARS } from "./builtin-tools.js";
 import type * as ComputerLifecycleModule from "./computer-lifecycle.js";
+import * as ComputerWorkspace from "./computer-workspace.js";
 import { createRunExecutor } from "./executor.js";
 import { catalogEntries, resolveCatalogCall } from "./lazy-tool-catalog.js";
 
@@ -234,6 +237,8 @@ function fixture({
     }
     yield { type: "done" as const, text: "Done" };
   });
+  const sandboxExecute = vi.fn<() => AsyncIterable<ProcessEvent>>();
+  const append = vi.fn(async (_event: { type: string; payload?: unknown }) => undefined);
   const executor = createRunExecutor({
     prisma,
     runtime: { describe: () => ({ capabilities: { scripted: false } }), run: runtimeRun },
@@ -255,7 +260,10 @@ function fixture({
         catalog ? resolveCatalogCall(call, catalogEntries([tool])) : undefined,
       execute,
     },
-    sandbox: { describe: () => ({ capabilities: { graphical: false } }) },
+    sandbox: {
+      describe: () => ({ capabilities: { graphical: false } }),
+      execute: sandboxExecute,
+    },
     memory: {
       read: async (request: { scope: string; path?: string }) => {
         const documents =
@@ -281,7 +289,7 @@ function fixture({
       commit,
     },
     memoryProviders: { resolve: async () => null },
-    events: { append: vi.fn(async () => undefined), pauseRunForInput, finalizeRun },
+    events: { append, pauseRunForInput, finalizeRun },
     jobs: { enqueue: vi.fn(async () => undefined) },
     secrets,
     autoReview: autoReviewProvider,
@@ -294,6 +302,9 @@ function fixture({
     commit,
     sharedMemoryState,
     pauseRunForInput,
+    runtimeRun,
+    sandboxExecute,
+    append,
     setCalls(next: typeof calls) {
       calls = next;
     },
@@ -306,6 +317,102 @@ function fixture({
     },
   };
 }
+
+describe("asynchronous shell Activity", () => {
+  it("publishes a redacted failure and rejects the observer after returning running", async () => {
+    vi.useFakeTimers();
+    const checkpoint = vi
+      .spyOn(ComputerWorkspace, "checkpointRunComputerWorkspace")
+      .mockResolvedValue(undefined);
+    const secret = "synthetic-shell-secret";
+    const f = fixture({
+      name: "shell",
+      builtin: true,
+      secrets: [secret],
+      rules: [{ effect: "always_allow", matchKind: "tool", matchValue: "shell" }],
+    });
+    let releaseStream!: () => void;
+    const streamGate = new Promise<void>((resolve) => {
+      releaseStream = resolve;
+    });
+    let signalStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      signalStarted = resolve;
+    });
+    let signalReturned!: () => void;
+    const returned = new Promise<void>((resolve) => {
+      signalReturned = resolve;
+    });
+    let result: unknown;
+    let completionOutcome!: Promise<{ error?: unknown; result?: unknown }>;
+    const observer = vi.fn((completion: Promise<unknown>) => {
+      completionOutcome = completion.then(
+        (value) => ({ result: value }),
+        (error: unknown) => ({ error }),
+      );
+    });
+    f.sandboxExecute.mockImplementation(async function* () {
+      signalStarted();
+      yield { type: "stdout", data: "Command started\n" };
+      await streamGate;
+      // Arrives just after the running response, arming the 400ms publication timer.
+      yield { type: "stdout", data: "Last output before transport failure\n" };
+      throw new Error(`Transport closed: ${secret}`);
+    });
+    f.runtimeRun.mockImplementation(async function* (request) {
+      result = await request.executeTool!(
+        "shell",
+        { command: "fake-command" },
+        "async-shell-1",
+        undefined,
+        { onShellStillRunning: observer },
+      );
+      signalReturned();
+      await completionOutcome;
+      yield { type: "done", text: "Observed shell failure" };
+    });
+    const commands = () =>
+      f.append.mock.calls
+        .map(([event]) => event)
+        .filter((event) => event.type === "computer.command")
+        .map((event) => event.payload as ComputerCommand);
+    const run = f.run();
+    try {
+      await started;
+      await vi.advanceTimersByTimeAsync(1_000);
+      await returned;
+      expect(result).toMatchObject({ running: true, code: null });
+      expect(observer).toHaveBeenCalledOnce();
+      expect(commands().length).toBeGreaterThan(0);
+      expect(commands().every((command) => command.status === "running")).toBe(true);
+
+      releaseStream();
+      const outcome = await completionOutcome;
+      expect(outcome.error).toBeInstanceOf(Error);
+      expect(outcome).not.toHaveProperty("result");
+      expect((outcome.error as Error).message).toContain("Transport closed:");
+      expect((outcome.error as Error).message).not.toContain(secret);
+      const failure = commands().at(-1);
+      expect(failure).toMatchObject({
+        executionId: "async-shell-1",
+        status: "done",
+        exitCode: 1,
+      });
+      expect(failure?.output).toBe((outcome.error as Error).message);
+      expect(failure?.output).not.toContain(secret);
+      const count = commands().length;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(commands()).toHaveLength(count);
+      expect(commands().filter((command) => command.status === "done")).toHaveLength(1);
+      expect(f.sandboxExecute).toHaveBeenCalledOnce();
+      await run;
+    } finally {
+      releaseStream();
+      checkpoint.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe("disabled builtins", () => {
   it("refuses a direct call before any effect or memory write", async () => {
