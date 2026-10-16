@@ -2,6 +2,7 @@ import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentRunRequest, AgentRuntimeEvent } from "@rakazo/adapter-kit";
+import { DEFAULT_AGENT_KNOWLEDGE } from "@rakazo/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CodexConnectionOptions, CodexObject } from "./codex-app-server.js";
 import { CodexAgentRuntime } from "./codex-runtime.js";
@@ -151,15 +152,21 @@ describe("Codex-owned runtime", () => {
     expect(first.filter((event) => event.type === "text")).toEqual([
       { type: "text", text: "Root result 1" },
     ]);
+    const updatedInstructions = `${DEFAULT_AGENT_KNOWLEDGE}\n\nUpdated role: validate the result.`;
     const second = await collect(
-      new CodexAgentRuntime({ sessionRoot: root, connectionFactory: fake.factory }).run(
-        input("run-two"),
-      ),
+      new CodexAgentRuntime({ sessionRoot: root, connectionFactory: fake.factory }).run({
+        ...input("run-two"),
+        instructions: updatedInstructions,
+      }),
     );
     expect(fake.calls.filter((call) => call.method === "thread/start")).toHaveLength(1);
     expect(fake.calls.find((call) => call.method === "thread/resume")?.params.threadId).toBe(
       "native-root",
     );
+    const resumedInstructions = fake.calls.find((call) => call.method === "thread/resume")?.params
+      .developerInstructions;
+    expect(resumedInstructions).toContain(updatedInstructions);
+    expect(resumedInstructions).not.toContain(input().instructions);
     expect(second).toContainEqual(
       expect.objectContaining({
         type: "checkpoint",

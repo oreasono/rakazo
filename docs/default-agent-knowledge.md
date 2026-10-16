@@ -32,7 +32,8 @@ pricing and universal inability are not included as durable knowledge.
 Executor tests cover inclusion with and without optional memory/context while
 retaining the agent's role and untrusted-data boundary. The offline PostgreSQL
 product journey checks that the real executor passes this block to Codex's
-`thread/start` parameters. Existing runtime tests cover the start/resume transport.
+`thread/start` parameters. A runtime test checks that resuming an existing thread
+receives the current working knowledge and role instead of stale instructions.
 These checks prove instruction delivery, not that a model always follows it or
 that the prose alone improves task outcomes. No live agents or personal memories
 are migrated by this source change.
