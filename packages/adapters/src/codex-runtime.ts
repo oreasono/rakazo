@@ -144,6 +144,7 @@ export class CodexAgentRuntime implements AgentRuntime {
     let turnId: string | undefined;
     let finished = false;
     let admitted = false;
+    let admissionClosed = false;
     let paused = false;
     let finalText = "";
     let progressItemId: string | undefined;
@@ -271,25 +272,65 @@ export class CodexAgentRuntime implements AgentRuntime {
         );
       }
     };
+    const journalSettled = async (runId: string) => {
+      try {
+        const records = await new CodexToolJournal(
+          join(home, "operations"),
+          { ...request, runId },
+          controller.signal,
+        ).records();
+        return records.every((record) => record.status === "completed");
+      } catch {
+        // Missing or unreadable receipts cannot prove that an earlier effect settled.
+        return false;
+      }
+    };
+    const sealAdmission = () => {
+      admissionClosed = true;
+      return bridge?.sealAdmission() ?? true;
+    };
+    const needsReview = async function* (
+      runId = request.runId,
+    ): AsyncGenerator<AgentRuntimeEvent, never> {
+      recoveryRequired = true;
+      sealAdmission();
+      state.runs[runId] = { ...state.runs[runId], status: "recovery_required" };
+      for (const value of Object.values(state.nodes)) {
+        if (value.threadId === state.rootThreadId || value.status !== "completed")
+          update(
+            node(value.threadId, value.parentThreadId, {
+              status: "failed",
+              nativeStatus: "recovery_required",
+              progress: "",
+            }),
+          );
+      }
+      await save();
+      for (const value of Object.values(state.nodes)) yield value;
+      yield {
+        type: "checkpoint",
+        blob: JSON.stringify({
+          runtime: "codex",
+          threadId: state.rootThreadId,
+          recovery: "needs_review",
+        }),
+      };
+      throw new CodexRecoveryRequired();
+    };
     try {
       for (const [otherId, other] of Object.entries(state.runs)) {
-        if (otherId === request.runId || other.status === "completed" || other.status === "paused")
-          continue;
-        const uncertain =
-          other.status === "interrupted"
-            ? other.journalVersion !== 1 ||
-              (
-                await new CodexToolJournal(
-                  join(home, "operations"),
-                  { ...request, runId: otherId },
-                  controller.signal,
-                ).records()
-              ).some((record) => record.status !== "completed")
-            : ["starting", "running", "recovering", "recovery_required"].includes(other.status);
-        if (uncertain)
-          throw new Error(
-            "An earlier Codex run still needs recovery or review; a new message cannot bypass its operation guard",
-          );
+        // Terminal root status is not proof that native child operations settled.
+        // Check completed/paused runs even for same-ID replay and pre-marker records.
+        if (other.status === "completed" || other.status === "paused") {
+          if (!(await journalSettled(otherId))) yield* needsReview(otherId);
+        } else if (otherId !== request.runId) {
+          if (
+            other.status !== "interrupted" ||
+            other.journalVersion !== 1 ||
+            !(await journalSettled(otherId))
+          )
+            yield* needsReview(otherId);
+        }
       }
       if (priorRun?.status === "completed") {
         finished = true;
@@ -301,6 +342,7 @@ export class CodexAgentRuntime implements AgentRuntime {
       if (priorRun && ["interrupted", "recovery_required"].includes(priorRun.status)) {
         // A crash between sending turn/start and recording its reply is ambiguous.
         // Never repeat an already admitted prompt or an external effect automatically.
+        if (priorRun.status === "recovery_required") throw new CodexRecoveryRequired();
         throw new Error(
           "This Codex run was interrupted by a worker restart; send a new message to resume the same conversation",
         );
@@ -402,6 +444,7 @@ export class CodexAgentRuntime implements AgentRuntime {
             const meta = params._meta as CodexObject | null | undefined;
             const allowed =
               admitted &&
+              !admissionClosed &&
               !recovering &&
               !finished &&
               !paused &&
@@ -465,30 +508,8 @@ export class CodexAgentRuntime implements AgentRuntime {
                 )
                 .join("\n")
             : "No remote operations were admitted before the interruption.";
-        } catch (error) {
-          recoveryRequired = true;
-          state.runs[request.runId] = { ...priorRun!, status: "recovery_required" };
-          for (const value of Object.values(state.nodes)) {
-            if (value.status !== "completed")
-              update(
-                node(value.threadId, value.parentThreadId, {
-                  status: "failed",
-                  nativeStatus: "recovery_required",
-                  progress: "",
-                }),
-              );
-          }
-          await save();
-          for (const value of Object.values(state.nodes)) yield value;
-          yield {
-            type: "checkpoint",
-            blob: JSON.stringify({
-              runtime: "codex",
-              threadId: state.rootThreadId,
-              recovery: "needs_review",
-            }),
-          };
-          throw error instanceof CodexRecoveryRequired ? error : new CodexRecoveryRequired();
+        } catch {
+          yield* needsReview();
         }
         // The old native child turn was interrupted. A receipt confirms its operation,
         // not successful completion of the child's reasoning turn.
@@ -561,29 +582,7 @@ export class CodexAgentRuntime implements AgentRuntime {
         }
         const { method, params } = notice;
         if (method === "rakazo/recovery-required") {
-          recoveryRequired = true;
-          state.runs[request.runId] = { status: "recovery_required", turnId, journalVersion: 1 };
-          for (const value of Object.values(state.nodes)) {
-            if (value.status !== "completed")
-              update(
-                node(value.threadId, value.parentThreadId, {
-                  status: "failed",
-                  nativeStatus: "recovery_required",
-                  progress: "",
-                }),
-              );
-          }
-          await save();
-          for (const value of Object.values(state.nodes)) yield value;
-          yield {
-            type: "checkpoint",
-            blob: JSON.stringify({
-              runtime: "codex",
-              threadId: state.rootThreadId,
-              recovery: "needs_review",
-            }),
-          };
-          throw new CodexRecoveryRequired();
+          yield* needsReview();
         }
         if (method === "rakazo/paused") break;
         const tid = String(params.threadId ?? "");
@@ -646,6 +645,9 @@ export class CodexAgentRuntime implements AgentRuntime {
         if (method === "turn/completed" && state.nodes[tid]) {
           const ended = params.turn as { id: string; status: string; error?: { message?: string } };
           if (tid === state.rootThreadId && ended.id === turnId) {
+            // Freeze admission before any await: an accepted child may still be
+            // preparing its receipt, or be queued behind another executor call.
+            if (!sealAdmission() || !(await journalSettled(request.runId))) yield* needsReview();
             if (ended.status === "failed") throw new Error("Codex model turn failed");
             if (ended.status !== "completed" && ended.status !== "interrupted") {
               throw new Error("Codex returned an unexpected terminal turn status");
@@ -662,6 +664,7 @@ export class CodexAgentRuntime implements AgentRuntime {
               status: interrupted ? "interrupted" : "completed",
               turnId,
               text: finalText,
+              journalVersion: 1,
             };
             await save();
             if (interrupted) throw new Error("Codex turn interrupted");
@@ -686,6 +689,7 @@ export class CodexAgentRuntime implements AgentRuntime {
       }
       if (terminalError) throw terminalError;
       if (!paused) throw new Error("Codex turn ended without completion");
+      if (!sealAdmission() || !(await journalSettled(request.runId))) yield* needsReview();
     } catch (error) {
       runFailed = true;
       throw terminalError ?? error;

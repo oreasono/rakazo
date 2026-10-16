@@ -8,7 +8,11 @@ import { CodexAgentRuntime } from "./codex-runtime.js";
 
 const bridges = vi.hoisted(() => ({ close: vi.fn(async () => {}) }));
 vi.mock("./codex-tool-bridge.js", () => ({
-  createCodexToolBridge: vi.fn(async () => ({ socket: "/fake/tools.sock", close: bridges.close })),
+  createCodexToolBridge: vi.fn(async () => ({
+    socket: "/fake/tools.sock",
+    sealAdmission: () => true,
+    close: bridges.close,
+  })),
 }));
 
 const directories: string[] = [];

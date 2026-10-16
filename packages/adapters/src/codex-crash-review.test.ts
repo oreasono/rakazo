@@ -13,6 +13,7 @@ import { CodexRecoveryRequired, CodexToolJournal } from "./codex-tool-journal.js
 vi.mock("./codex-tool-bridge.js", () => ({
   createCodexToolBridge: vi.fn(async () => ({
     socket: "unused-test-socket",
+    sealAdmission: () => true,
     close: async () => {},
   })),
 }));

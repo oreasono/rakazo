@@ -23,6 +23,12 @@ export async function createCodexToolBridge(options: {
   const tools = new Map(options.tools.map((tool) => [tool.name, tool]));
   let serial = Promise.resolve();
   let closed = false;
+  let pendingExecutions = 0;
+  let needsReview = false;
+  const requireReview = () => {
+    needsReview = true;
+    options.recoveryRequired?.();
+  };
   const server = createServer(async (req, res) => {
     const reply = (status: number, value: unknown) => {
       res.writeHead(status, { "content-type": "application/json" });
@@ -51,20 +57,29 @@ export async function createCodexToolBridge(options: {
         });
         return;
       }
+      if (options.recoveryOnly) {
+        requireReview();
+        throw new Error("Recovery cannot admit tools");
+      }
       const name = body.params?.name;
       const tool = name ? tools.get(name) : undefined;
-      if (
-        options.recoveryOnly ||
-        body.method !== "tools/call" ||
-        !tool ||
-        !/^[a-zA-Z0-9-]{1,80}$/.test(body.executionId)
-      ) {
+      if (body.method !== "tools/call" || !tool || !/^[a-zA-Z0-9-]{1,80}$/.test(body.executionId)) {
         throw new Error("Tool is not granted");
       }
       const args = body.params?.arguments ?? {};
       if (!args || typeof args !== "object" || Array.isArray(args))
         throw new Error("Invalid arguments");
       const executionId = JSON.stringify(["codex-tool", options.request.runId, body.executionId]);
+      // Count before the first await, including calls queued before a journal record exists.
+      // Pause controls never dispatch an executor operation or create a receipt.
+      const executes = tool.name !== "ask_user" && tool.name !== "request_takeover";
+      if (executes) pendingExecutions++;
+      let unsettled = executes;
+      const settleExecution = () => {
+        if (!unsettled) return;
+        unsettled = false;
+        pendingExecutions--;
+      };
       // Native children inherit one root-scoped tool grant and one desktop writer.
       const work = serial.then(async () => {
         if (closed || options.signal.aborted) throw new Error("Run ended");
@@ -92,6 +107,9 @@ export async function createCodexToolBridge(options: {
           result = options.journal
             ? await options.journal.execute(tool, args, executionId)
             : await options.request.executeTool(tool.name, args, executionId, tool.route);
+          // The receipt is durable now. An approval pause must not wait for its
+          // accounting callback; other queued executor calls remain counted.
+          settleExecution();
           if (isToolPauseResult(result)) options.pause();
           if (
             result &&
@@ -105,10 +123,11 @@ export async function createCodexToolBridge(options: {
           return { content: [{ type: "text", text: JSON.stringify(result ?? null) }] };
         } catch (error) {
           failure = error;
-          if (error instanceof CodexRecoveryRequired) options.recoveryRequired?.();
+          if (error instanceof CodexRecoveryRequired) requireReview();
           // Preserve a useful error without returning arbitrary adapter diagnostics.
           return { isError: true, content: [{ type: "text", text: "The requested tool failed." }] };
         } finally {
+          settleExecution();
           await options.request.onToolCompleted?.({
             name: tool.name,
             executionId,
@@ -118,10 +137,7 @@ export async function createCodexToolBridge(options: {
           });
         }
       });
-      serial = work.then(
-        () => undefined,
-        () => undefined,
-      );
+      serial = work.then(settleExecution, settleExecution);
       reply(200, await work);
     } catch {
       reply(403, { error: "Tool request unavailable" });
@@ -135,6 +151,11 @@ export async function createCodexToolBridge(options: {
   await chmod(socket, 0o600);
   return {
     socket,
+    /** Close admission synchronously before taking a terminal journal snapshot. */
+    sealAdmission() {
+      closed = true;
+      return pendingExecutions === 0 && !needsReview;
+    },
     async close() {
       closed = true;
       server.closeAllConnections();
