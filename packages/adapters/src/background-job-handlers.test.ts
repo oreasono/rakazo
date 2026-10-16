@@ -21,6 +21,26 @@ vi.mock("./messaging-delivery.js", () => ({
 }));
 
 describe("createBackgroundJobHandlers", () => {
+  it("passes a recovery wakeup's original run and expired fence into executor admission", async () => {
+    const continueRun = vi.fn(async () => undefined);
+    const handlers = createBackgroundJobHandlers({
+      executor: { continueRun } as unknown as ReturnType<typeof createRunExecutor>,
+      prisma: {} as PrismaClient,
+      sandbox: {} as SandboxProvider,
+      home: {} as AgentHomeStore,
+      jobs: {} as JobPublisher,
+      events: {} as ThreadEvents,
+      workerId: "replacement-worker",
+      runtime: {} as AgentRuntime,
+      secretStore: {} as EncryptedSecretStore,
+      memoryProviders: { resolve: vi.fn(async () => null) },
+    });
+
+    await handlers["run.continue"]({ runId: "original-run", recoveryFence: 7 });
+
+    expect(continueRun).toHaveBeenCalledExactlyOnceWith("original-run", "replacement-worker", 7);
+  });
+
   it("delivers directly when shutdown rejects a completed run's mirror job", async () => {
     const enqueueError = new Error("Background job publisher is closing");
     const jobs = {

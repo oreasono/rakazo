@@ -1,5 +1,10 @@
 import type { MessageBlock, ThreadMessage } from "@rakazo/contracts";
 import { cloudAgentBlockFromPayload } from "./cloud-agent.js";
+import {
+  nativeSubagentMetadata,
+  preserveNativeSubagentRevisions,
+  upsertNativeSubagentMessage,
+} from "./native-session-tree.js";
 
 export function projectMessages(
   events: Array<{
@@ -54,26 +59,33 @@ export function projectMessages(
     const payload = asRecord(event.payload);
     const createdAt =
       typeof event.createdAt === "string" ? event.createdAt : event.createdAt.toISOString();
-    if (event.type === "thread.message.created") {
+    if (event.type === "thread.message.created" || event.type === "thread.message.updated") {
       clearLive(event);
-      const role = (payload.role as ThreadMessage["role"]) ?? "bot";
-      const blocks = (payload.blocks as MessageBlock[]) ?? [];
-      for (const block of blocks) {
+      const id = (payload.messageId as string) ?? event.id;
+      const previous = messages.find((message) => message.id === id);
+      if (previous && previous.seq > event.seq) continue;
+      const next: ThreadMessage = preserveNativeSubagentRevisions(messages, {
+        id,
+        threadId: event.threadId,
+        seq: event.seq,
+        role: (payload.role as ThreadMessage["role"]) ?? previous?.role ?? "bot",
+        blocks: (payload.blocks as MessageBlock[]) ?? previous?.blocks ?? [],
+        botId: event.botId ?? previous?.botId,
+        runId: event.runId ?? previous?.runId,
+        createdAt: previous?.createdAt ?? createdAt,
+      });
+      for (const block of next.blocks) {
         if (block.kind === "subagent") {
           durableSubagents.add(block.agentId);
           liveSubagents.delete(block.agentId);
+          for (let index = messages.length - 1; index >= 0; index--) {
+            if (messages[index]?.id === `subagent:${block.agentId}`) messages.splice(index, 1);
+          }
         }
       }
-      messages.push({
-        id: (payload.messageId as string) ?? event.id,
-        threadId: event.threadId,
-        seq: event.seq,
-        role,
-        blocks,
-        botId: event.botId ?? undefined,
-        runId: event.runId ?? undefined,
-        createdAt,
-      });
+      const previousIndex = messages.findIndex((message) => message.id === id);
+      if (previousIndex === -1) messages.push(next);
+      else messages[previousIndex] = next;
       continue;
     }
     if (event.type === "thread.cloud_agent") {
@@ -120,8 +132,9 @@ export function projectMessages(
     }
     if (event.type === "thread.subagent") {
       const block = subagentBlockFromPayload(payload);
-      if (durableSubagents.has(block.agentId)) continue;
-      liveSubagents.set(block.agentId, {
+      const native = nativeSubagentMetadata(block);
+      if (!native && durableSubagents.has(block.agentId)) continue;
+      const next: ThreadMessage = {
         id: `subagent:${block.agentId}`,
         threadId: event.threadId,
         seq: event.seq,
@@ -130,7 +143,11 @@ export function projectMessages(
         botId: event.botId ?? undefined,
         runId: event.runId ?? undefined,
         createdAt,
-      });
+      };
+      if (native) {
+        const updated = upsertNativeSubagentMessage(messages, next);
+        messages.splice(0, messages.length, ...updated);
+      } else liveSubagents.set(block.agentId, next);
       continue;
     }
     if (
@@ -367,6 +384,7 @@ export function subagentBlockFromPayload(
   const status = payload.status;
   return {
     kind: "subagent",
+    ...nativeSubagentMetadata(payload),
     agentId: String(payload.agentId ?? ""),
     name: String(payload.name ?? "subagent"),
     task: String(payload.task ?? ""),

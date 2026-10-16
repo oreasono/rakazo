@@ -1,5 +1,10 @@
 import type { JobPublisher, NotificationProvider } from "@rakazo/adapter-kit";
-import { messagingDeliverJob, routineWakeupJob, runContinueJob } from "@rakazo/adapter-kit";
+import {
+  messagingDeliverJob,
+  routineWakeupJob,
+  runContinueJob,
+  runRecoveryJob,
+} from "@rakazo/adapter-kit";
 import type { MessageBlock } from "@rakazo/contracts";
 import { stuckWorkStatusMessages } from "@rakazo/core";
 import type { Pool, PrismaClient, ThreadEvents } from "@rakazo/db";
@@ -197,7 +202,7 @@ export function createJobReconciler(
           },
           orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
           take: batchSize,
-          select: { id: true, updatedAt: true },
+          select: { id: true, updatedAt: true, status: true, leaseFence: true },
         }),
         deps.prisma.routine.findMany({
           where: {
@@ -326,11 +331,18 @@ export function createJobReconciler(
         );
       }
 
-      // A queued run already has a job while it waits out failure backoff.
-      // Default replace would zero that job's attempts and run it now. keepExisting
-      // leaves the job while attempts remain, and still replaces one that is exhausted.
+      // Preserve queued-job backoff. An expired execution needs a separate fenced
+      // wakeup: its original Graphile job can remain locked for four hours after
+      // SIGKILL. Only the executor's conditional Run lease claim admits execution;
+      // a delayed recovery wakeup cannot resume a newer attempt or a human wait.
       await Promise.all([
-        ...runs.map((run) => deps.jobs.enqueue({ ...runContinueJob(run.id), keepExisting: true })),
+        ...runs.map((run) =>
+          deps.jobs.enqueue(
+            run.status === "leased" || run.status === "running"
+              ? runRecoveryJob(run.id, run.leaseFence)
+              : { ...runContinueJob(run.id), keepExisting: true },
+          ),
+        ),
         ...routines.flatMap((routine) =>
           routine.nextRunAt
             ? [deps.jobs.enqueue(routineWakeupJob(routine.id, routine.nextRunAt))]

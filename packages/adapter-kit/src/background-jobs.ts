@@ -7,7 +7,10 @@ import type {
 } from "./types.js";
 
 const payloadSchemas = {
-  "run.continue": z.object({ runId: z.string().min(1) }),
+  "run.continue": z.object({
+    runId: z.string().min(1),
+    recoveryFence: z.number().int().nonnegative().optional(),
+  }),
   "routine.wakeup": z.object({
     routineId: z.string().min(1),
     scheduledFor: z.string().datetime({ offset: true }),
@@ -68,6 +71,16 @@ export function runContinueJob(runId: string): BackgroundJob {
     name: "run.continue",
     payload: { runId },
     replaceKey: runJobKey(runId),
+  };
+}
+
+/** A wakeup for an expired execution, distinct from its possibly locked original job. */
+export function runRecoveryJob(runId: string, recoveryFence: number): BackgroundJob {
+  return {
+    name: "run.continue",
+    payload: { runId, recoveryFence },
+    replaceKey: `${runJobKey(runId)}:recovery:${recoveryFence}`,
+    keepExisting: true,
   };
 }
 

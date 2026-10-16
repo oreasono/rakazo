@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { PiAgentRuntime } from "../../adapters/src/pi-runtime.js";
 import { historyFixture } from "./evals/history-fixtures.js";
 import { runTrial } from "./evals/runner.js";
 import { startModelEmulator } from "./model-emulator.js";
@@ -67,6 +68,8 @@ describe.skipIf(!enabled)("short original product history", () => {
                 dataDir,
                 sandboxProvider: "fake",
                 agentRuntime: "pi",
+                // Legacy Pi fixture: production non-scripted selection is Codex.
+                runtime: new PiAgentRuntime(),
                 contextStrategy: strategy,
                 wakeupDriver: "memory",
                 signupsEnabled: "true",

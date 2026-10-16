@@ -38,6 +38,7 @@ import type {
   ConnectorEvent,
   ConnectorTool,
   ControlLeaseRef,
+  ExecutionReconciliation,
   MemoryCapabilities,
   MemoryCommitRequest,
   MemoryExportRequest,
@@ -113,6 +114,12 @@ export interface SandboxProvider {
     request: CommandRequest,
     context: AdapterContext,
   ): AsyncIterable<ProcessEvent>;
+  /** Read-only durable result lookup. Missing/ambiguous receipts must not trigger dispatch. */
+  reconcileExecution?(
+    computer: ComputerRef,
+    operationId: string,
+    context: AdapterContext,
+  ): Promise<ExecutionReconciliation>;
   inspectBackgroundWork?(
     computer: ComputerRef,
     markerId: string,

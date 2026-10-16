@@ -30,16 +30,21 @@ import {
   isServerUnreachable,
   isUnreachableStatus,
   mergeThreadHistory,
+  nativeSubagentMetadata,
   prependThreadHistoryPage,
+  preserveNativeSessionMessages,
+  preserveNativeSubagentRevisions,
   progressMessageId,
   readBoundedJsonResponse,
   reduceLiveMessageBlocks,
   replyMetadata,
   runFailureError,
   signupRequiresEmailVerification,
+  subagentBlockFromPayload,
   takeLiveMessage,
   updateCloudAgentMessages,
   upsertMessageById,
+  upsertNativeSubagentMessage,
 } from "@rakazo/core";
 import * as SecureStore from "expo-secure-store";
 import { promptAiConsent } from "./ai-consent";
@@ -1067,7 +1072,20 @@ export function mergeMobileSnapshot(
   next: MobileSnapshot,
   preserveLoadedHistory = false,
 ): MobileSnapshot {
-  return mergeThreadHistory(prev, next, preserveLoadedHistory);
+  // A refresh begun before a native state update must not roll the visible tree back.
+  if (
+    prev?.threadId === next.threadId &&
+    prev?.cursor != null &&
+    next.cursor != null &&
+    prev.cursor > next.cursor
+  )
+    return prev;
+  const merged = mergeThreadHistory(prev, next, preserveLoadedHistory);
+  if (!prev || prev.threadId !== next.threadId) return merged;
+  return {
+    ...merged,
+    messages: preserveNativeSessionMessages([...prev.messages, ...next.messages], merged.messages),
+  };
 }
 
 export function prependMobileMessagePage(
@@ -1357,25 +1375,24 @@ export function applyMobileThreadEvent(
     return { ...prev, cursor: event.seq ?? prev.cursor };
   }
   if (event.type === "thread.subagent") {
-    const agentId = String(event.payload?.agentId ?? event.id ?? "live");
-    const status = event.payload?.status;
+    const block = subagentBlockFromPayload(event.payload ?? {});
     const streaming: MobileMessage = {
-      id: `subagent:${agentId}`,
+      id: `subagent:${block.agentId}`,
+      seq: event.seq,
+      createdAt: event.createdAt,
       role: "bot",
       ...(event.botId ? { botId: event.botId } : {}),
       ...(event.runId ? { runId: event.runId } : {}),
-      blocks: [
-        {
-          kind: "subagent",
-          agentId,
-          name: String(event.payload?.name ?? "subagent"),
-          task: String(event.payload?.task ?? ""),
-          status: status === "completed" || status === "failed" ? status : "running",
-          progress: event.payload?.progress ? String(event.payload.progress) : undefined,
-          result: event.payload?.result ? String(event.payload.result) : undefined,
-        },
-      ],
+      blocks: [block],
     };
+    if (nativeSubagentMetadata(block)) {
+      if (event.seq != null && prev.cursor != null && event.seq <= prev.cursor) return prev;
+      return {
+        ...prev,
+        cursor: event.seq ?? prev.cursor,
+        messages: upsertNativeSubagentMessage(prev.messages, streaming),
+      };
+    }
     return {
       ...prev,
       cursor: event.seq ?? prev.cursor,
@@ -1393,8 +1410,9 @@ export function applyMobileThreadEvent(
     const { remaining } = takeLiveMessage(prev.messages, progressMessageId(event));
     const id = String(event.payload?.messageId ?? event.id ?? `msg:${event.seq ?? 0}`);
     const known = prev.messages.find((message) => message.id === id);
-    const next: MobileMessage = {
+    const next: MobileMessage = preserveNativeSubagentRevisions(prev.messages, {
       id,
+      seq: event.seq,
       createdAt: known?.createdAt ?? event.createdAt,
       runId: event.runId ? String(event.runId) : undefined,
       role: (event.payload?.role as MobileMessage["role"]) ?? "bot",
@@ -1404,7 +1422,14 @@ export function applyMobileThreadEvent(
       blocks: (event.payload?.blocks as MobileMessage["blocks"]) ?? [],
       botId: event.botId ?? (event.payload?.botId ? String(event.payload.botId) : undefined),
       ...replyMetadata(event.payload ?? {}, known),
-    };
+    });
+    if (
+      next.blocks.some((block) => block.kind === "subagent" && nativeSubagentMetadata(block)) &&
+      event.seq != null &&
+      prev.cursor != null &&
+      event.seq <= prev.cursor
+    )
+      return prev;
     return {
       ...prev,
       cursor: event.seq ?? prev.cursor,

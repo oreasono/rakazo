@@ -9,6 +9,8 @@ import { DockerSandboxProvider } from "./docker-sandbox.js";
 import { ManagedSandboxEmulator } from "./e2b-emulator.js";
 import { E2BSandboxProvider } from "./e2b-sandbox.js";
 import { FakeSandboxProvider } from "./fake-sandbox.js";
+import type { IncusSandboxOptions } from "./incus-sandbox.js";
+import { IncusSandboxProvider } from "./incus-sandbox.js";
 import { NoneSandboxProvider } from "./none-sandbox.js";
 import { RailwaySandboxProvider } from "./railway-sandbox.js";
 
@@ -29,6 +31,7 @@ export interface SandboxProviderOptions {
   boxApiKey?: string;
   boxApiUrl?: string;
   dataDir?: string;
+  incus?: IncusSandboxOptions;
 }
 
 function missingRemoteKey(
@@ -42,6 +45,10 @@ function missingRemoteKey(
 
 export function createSandboxProvider(kind: string, opts: SandboxProviderOptions): SandboxProvider {
   switch (kind) {
+    case "incus":
+      if (!opts.incus)
+        throw new Error("INCUS_CONFIG_FILE is required for the Incus computer provider");
+      return new IncusSandboxProvider(opts.incus);
     case "none":
     case "":
       return new NoneSandboxProvider();
@@ -95,7 +102,7 @@ export function createSandboxProvider(kind: string, opts: SandboxProviderOptions
       return new FakeSandboxProvider();
     default:
       throw new Error(
-        `Unknown SANDBOX_PROVIDER "${kind}". Use none | docker | e2b | daytona | createos | box | railway | e2b-emulator | daytona-emulator | box-emulator | desktop | fake.`,
+        `Unknown SANDBOX_PROVIDER "${kind}". Use none | docker | e2b | daytona | createos | box | railway | incus | e2b-emulator | daytona-emulator | box-emulator | desktop | fake.`,
       );
   }
 }

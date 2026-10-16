@@ -1,6 +1,7 @@
 import type { BackgroundJobHandlers } from "@rakazo/adapter-kit";
+import { runContinueJob, runRecoveryJob } from "@rakazo/adapter-kit";
 import { Pool } from "pg";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { GraphileJobPublisher, GraphileJobWorkerHost } from "./wakeup.js";
 
 const databaseUrl = process.env.DATABASE_URL;
@@ -8,8 +9,15 @@ const describePostgres =
   process.env.VERIFY_DATABASE && databaseUrl ? describe.sequential : describe.skip;
 
 let pool: Pool | undefined;
+const contractSchema = `worker_recovery_contract_${process.pid}_${Date.now().toString(36)}`;
 function testPool(): Pool {
-  pool ??= new Pool({ connectionString: databaseUrl, max: 4 });
+  pool ??= new Pool({
+    connectionString: databaseUrl,
+    max: 4,
+    // Prisma stores DateTime as a UTC timestamp without time zone. Exercise the
+    // SQL comparison under a non-UTC server session as well as real row locks.
+    options: `-c search_path=${contractSchema},public -c TimeZone=Asia/Tokyo`,
+  });
   return pool;
 }
 afterEach(async () => {
@@ -45,6 +53,263 @@ async function waitFor(assertion: () => void, timeoutMs = 10_000): Promise<void>
 }
 
 describePostgres("Graphile background jobs (PostgreSQL contract)", () => {
+  let createdSchema = false;
+  beforeAll(async () => {
+    // Lease fixtures live in a private schema; never modify real product Runs.
+    // These are the exact columns the publisher's SQL uses from the Prisma Run.
+    await testPool().query(`create schema "${contractSchema}"`);
+    createdSchema = true;
+    await testPool().query(`create table runs (
+      id text primary key,
+      status text not null,
+      "leaseFence" integer not null,
+      "leaseExpiresAt" timestamp(3)
+    )`);
+  });
+  afterAll(async () => {
+    try {
+      if (createdSchema) await testPool().query(`drop schema "${contractSchema}" cascade`);
+    } finally {
+      await pool?.end();
+      pool = undefined;
+    }
+  });
+
+  async function seedRunState(
+    runId: string,
+    {
+      status = "running",
+      fence = 7,
+      expiresInSeconds = -60,
+    }: {
+      status?: string;
+      fence?: number;
+      expiresInSeconds?: number | null;
+    } = {},
+  ) {
+    await testPool().query(
+      `insert into runs (id, status, "leaseFence", "leaseExpiresAt")
+       values ($1, $2, $3, (clock_timestamp() at time zone 'UTC') + $4::integer * interval '1 second')`,
+      [runId, status, fence, expiresInSeconds],
+    );
+  }
+
+  it("retires the original retry and dispatches fenced recovery without unlocking active jobs", async () => {
+    const publisher = new GraphileJobPublisher(testPool());
+    const host = new GraphileJobWorkerHost(testPool(), { concurrency: 3, pollInterval: 25 });
+    const runId = `contract-recovery-${Date.now()}`;
+    const original = runContinueJob(runId);
+    const recovery = runRecoveryJob(runId, 7);
+    const originalEntered = deferred();
+    const recoveryEntered = deferred();
+    const release = deferred();
+    const received: Array<{ runId: string; recoveryFence?: number }> = [];
+    const target = handlers({
+      "run.continue": async (payload) => {
+        received.push(payload);
+        if (received.length === 1) {
+          originalEntered.resolve();
+          await release.promise;
+          throw new Error("original worker failed after recovery took over");
+        } else if (received.length === 2) {
+          recoveryEntered.resolve();
+          await release.promise;
+        }
+      },
+    });
+
+    try {
+      await seedRunState(runId);
+      await host.start(target);
+      await publisher.enqueue(original);
+      await originalEntered.promise;
+      const before = await testPool().query<{ id: string; locked_at: Date; locked_by: string }>(
+        "select id, locked_at, locked_by from graphile_worker._private_jobs where key = $1",
+        [original.replaceKey],
+      );
+      expect(before.rows[0]?.locked_at).toBeInstanceOf(Date);
+
+      await publisher.enqueue(recovery);
+      await recoveryEntered.promise;
+      // Model a second worker crash before the Run claim: its Graphile handler
+      // is still locked, so republishing must create a runnable replacement.
+      await publisher.enqueue(recovery);
+      await waitFor(() => expect(received).toHaveLength(3));
+
+      expect(received).toEqual([
+        { runId },
+        { runId, recoveryFence: 7 },
+        { runId, recoveryFence: 7 },
+      ]);
+      const after = await testPool().query(
+        "select id, locked_at, locked_by, key, attempts, max_attempts from graphile_worker._private_jobs where id = $1",
+        [before.rows[0]!.id],
+      );
+      expect(after.rows[0]).toMatchObject({ ...before.rows[0], key: null });
+      expect(after.rows[0].attempts).toBe(after.rows[0].max_attempts);
+
+      // When Graphile eventually unlocks the original job, it must remain
+      // unavailable. Otherwise its unguarded payload can resume a human wait.
+      release.resolve();
+      await vi.waitFor(async () => {
+        const released = await testPool().query(
+          "select locked_at, attempts, max_attempts, is_available from graphile_worker._private_jobs where id = $1",
+          [before.rows[0]!.id],
+        );
+        expect(released.rows[0]).toMatchObject({ locked_at: null, is_available: false });
+        expect(released.rows[0].attempts).toBe(released.rows[0].max_attempts);
+      });
+      expect(received).toHaveLength(3);
+    } finally {
+      release.resolve();
+      await host.stop();
+      await publisher.cancel(original.replaceKey!).catch(() => undefined);
+      await publisher.cancel(recovery.replaceKey!).catch(() => undefined);
+      await publisher.close();
+    }
+  });
+
+  it("does not remove an unlocked explicit continuation when an old recovery wakeup arrives", async () => {
+    const publisher = new GraphileJobPublisher(testPool());
+    const runId = `contract-delayed-recovery-${Date.now()}`;
+    const original = { ...runContinueJob(runId), availableAt: new Date(Date.now() + 60_000) };
+    const recovery = runRecoveryJob(runId, 7);
+    try {
+      await seedRunState(runId);
+      await publisher.enqueue(original);
+      const before = await keyedRow(original.replaceKey!);
+
+      await publisher.enqueue(recovery);
+
+      expect(await keyedRow(original.replaceKey!)).toEqual(before);
+    } finally {
+      await publisher.cancel(original.replaceKey!).catch(() => undefined);
+      await publisher.cancel(recovery.replaceKey!).catch(() => undefined);
+      await publisher.close();
+    }
+  });
+
+  it.each([
+    { label: "new-fence", state: { fence: 8 } },
+    { label: "human-wait", state: { status: "waiting_input" } },
+    { label: "takeover", state: { status: "waiting_takeover" } },
+    { label: "queued-answer", state: { status: "queued" } },
+    { label: "renewed", state: { expiresInSeconds: 60 } },
+    { label: "unknown-expiry", state: { expiresInSeconds: null } },
+    { label: "completed", state: { status: "completed" } },
+  ])(
+    "does not retire a locked normal job after the Run changes to $label",
+    async ({ label, state }) => {
+      const publisher = new GraphileJobPublisher(testPool());
+      const host = new GraphileJobWorkerHost(testPool(), { concurrency: 2, pollInterval: 25 });
+      const runId = `contract-stale-${label}-${Date.now()}`;
+      const original = runContinueJob(runId);
+      const recovery = runRecoveryJob(runId, 7);
+      const entered = deferred();
+      const release = deferred();
+      try {
+        await seedRunState(runId, state);
+        await host.start(
+          handlers({
+            "run.continue": async (payload) => {
+              if (payload.recoveryFence === undefined) {
+                entered.resolve();
+                await release.promise;
+              }
+            },
+          }),
+        );
+        await publisher.enqueue(original);
+        await entered.promise;
+        const read = () =>
+          testPool().query(
+            "select id, key, attempts, max_attempts, locked_at, locked_by from graphile_worker._private_jobs where key = $1",
+            [original.replaceKey],
+          );
+        const before = await read();
+        expect(before.rows[0]?.locked_at).toBeInstanceOf(Date);
+        expect(before.rows[0].attempts).toBeLessThan(before.rows[0].max_attempts);
+
+        await publisher.enqueue(recovery);
+
+        expect((await read()).rows).toEqual(before.rows);
+      } finally {
+        release.resolve();
+        await host.stop();
+        await publisher.cancel(original.replaceKey!).catch(() => undefined);
+        await publisher.cancel(recovery.replaceKey!).catch(() => undefined);
+        await publisher.close();
+      }
+    },
+  );
+
+  it("rechecks the Run predicate after a concurrent newer claim releases its row lock", async () => {
+    const publisher = new GraphileJobPublisher(testPool());
+    const host = new GraphileJobWorkerHost(testPool(), { concurrency: 2, pollInterval: 25 });
+    const runId = `contract-retirement-race-${Date.now()}`;
+    const original = runContinueJob(runId);
+    const recovery = runRecoveryJob(runId, 7);
+    const entered = deferred();
+    const release = deferred();
+    const writer = await testPool().connect();
+    let transactionOpen = false;
+    let publication: Promise<void> | undefined;
+    try {
+      await seedRunState(runId);
+      await host.start(
+        handlers({
+          "run.continue": async (payload) => {
+            if (payload.recoveryFence === undefined) {
+              entered.resolve();
+              await release.promise;
+            }
+          },
+        }),
+      );
+      await publisher.enqueue(original);
+      await entered.promise;
+      const before = await testPool().query(
+        "select id, key, attempts, max_attempts, locked_at, locked_by from graphile_worker._private_jobs where key = $1",
+        [original.replaceKey],
+      );
+      await writer.query("begin");
+      transactionOpen = true;
+      await writer.query('update runs set "leaseFence" = 8 where id = $1', [runId]);
+
+      publication = publisher.enqueue(recovery);
+      void publication.catch(() => undefined);
+      await vi.waitFor(
+        async () => {
+          const blocked = await testPool().query(
+            `select count(*)::integer as count from pg_stat_activity
+           where datname = current_database() and wait_event_type = 'Lock'
+             and query like 'with eligible_run as materialized%'`,
+          );
+          expect(blocked.rows[0].count).toBe(1);
+        },
+        { timeout: 5_000, interval: 25 },
+      );
+      await writer.query("commit");
+      transactionOpen = false;
+      await publication;
+
+      const after = await testPool().query(
+        "select id, key, attempts, max_attempts, locked_at, locked_by from graphile_worker._private_jobs where key = $1",
+        [original.replaceKey],
+      );
+      expect(after.rows).toEqual(before.rows);
+    } finally {
+      if (transactionOpen) await writer.query("rollback");
+      writer.release();
+      await publication?.catch(() => undefined);
+      release.resolve();
+      await host.stop();
+      await publisher.cancel(original.replaceKey!).catch(() => undefined);
+      await publisher.cancel(recovery.replaceKey!).catch(() => undefined);
+      await publisher.close();
+    }
+  });
+
   it("waits for an active handler during graceful shutdown", async () => {
     const publisher = new GraphileJobPublisher(testPool());
     const host = new GraphileJobWorkerHost(testPool(), { concurrency: 1, pollInterval: 25 });

@@ -1,6 +1,10 @@
 vi.mock("./ai-consent", () => ({ promptAiConsent: vi.fn() }));
 
-import { isServerUnreachable, withLiveStreamingProgress } from "@rakazo/core";
+import {
+  buildNativeSessionTrees,
+  isServerUnreachable,
+  withLiveStreamingProgress,
+} from "@rakazo/core";
 import * as SecureStore from "expo-secure-store";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { promptAiConsent } from "./ai-consent";
@@ -3224,4 +3228,206 @@ it("localizes non-JSON successful account-security responses", async () => {
     vi.fn(async () => new Response("<html>Gateway error</html>")),
   );
   await expect(fetchAccountSecurity()).rejects.toThrow("Could not load sign-in options");
+});
+
+describe("native Codex recovery", () => {
+  it("rebuilds the same tree from durable messages and accepts a later resume without duplicating cards", () => {
+    const native = {
+      kind: "subagent" as const,
+      runtime: "codex" as const,
+      agentId: "native-child",
+      threadId: "native-child",
+      rootThreadId: "native-root",
+      parentThreadId: "native-root",
+      name: "Research",
+      task: "Read the screen",
+      status: "running" as const,
+    };
+    const live = applyMobileThreadEvent(snapshot([]), {
+      type: "thread.subagent",
+      seq: 4,
+      payload: native,
+    });
+    expect(buildNativeSessionTrees(live?.messages ?? [])[0]?.nodes[1]).toMatchObject({
+      threadId: "native-child",
+      parentThreadId: "native-root",
+      status: "running",
+    });
+    const durable = applyMobileThreadEvent(live, {
+      type: "thread.message.created",
+      seq: 5,
+      payload: { messageId: "stored-native", blocks: [{ ...native, status: "completed" }] },
+    });
+    const restored = JSON.parse(JSON.stringify(durable));
+    expect(buildNativeSessionTrees(restored.messages)[0]?.nodes[1]?.status).toBe("completed");
+    expect(
+      applyMobileThreadEvent(restored, { type: "thread.subagent", seq: 4, payload: native }),
+    ).toBe(restored);
+    const resumed = applyMobileThreadEvent(restored, {
+      type: "thread.subagent",
+      seq: 6,
+      payload: native,
+    });
+    expect(resumed?.messages).toHaveLength(1);
+    expect(resumed?.messages[0]?.id).toBe("stored-native");
+    expect(buildNativeSessionTrees(resumed?.messages ?? [])[0]?.nodes[1]?.status).toBe("running");
+    expect(
+      applyMobileThreadEvent(resumed, {
+        type: "thread.message.updated",
+        seq: 5,
+        payload: { messageId: "stored-native", blocks: [{ ...native, status: "completed" }] },
+      }),
+    ).toBe(resumed);
+    expect(mergeMobileSnapshot(resumed, restored)).toBe(resumed);
+  });
+});
+
+describe("native revision ordering", () => {
+  it.each([false, true])(
+    "keeps recovery revisions monotonic through refresh (history=%s)",
+    (history) => {
+      const native = (id: string, nativeStatus: string, nativeRevision: number) => ({
+        kind: "subagent" as const,
+        runtime: "codex" as const,
+        agentId: id,
+        threadId: id,
+        rootThreadId: "root",
+        parentThreadId: id === "root" ? null : "root",
+        name: id,
+        task: "",
+        status:
+          nativeStatus === "recovering"
+            ? ("running" as const)
+            : nativeStatus === "completed"
+              ? ("completed" as const)
+              : ("failed" as const),
+        nativeStatus,
+        nativeRevision,
+      });
+      const interrupted = snapshot([
+        mobileMessage("stored-root", [native("root", "interrupted", 1)], 1),
+        mobileMessage("stored-child", [native("child", "interrupted", 2)], 2),
+      ]);
+      let current: MobileSnapshot | null = JSON.parse(JSON.stringify(interrupted));
+      for (const [index, id] of ["root", "child"].entries())
+        current = applyMobileThreadEvent(current, {
+          type: "thread.subagent",
+          seq: 900 + index,
+          payload: native(id, "recovering", 3 + index),
+        });
+      current = applyMobileThreadEvent(current, {
+        type: "thread.progress",
+        seq: 902,
+        payload: { text: "Old draft" },
+      });
+      const refreshed = mergeMobileSnapshot(
+        current,
+        {
+          ...interrupted,
+          cursor: 903,
+          messages: [interrupted.messages[0]!],
+        },
+        history,
+      );
+      expect(buildNativeSessionTrees(refreshed.messages)[0]?.nodes).toMatchObject([
+        { threadId: "root", nativeStatus: "recovering", nativeRevision: 3 },
+        {
+          threadId: "child",
+          parentThreadId: "root",
+          nativeStatus: "recovering",
+          nativeRevision: 4,
+        },
+      ]);
+      expect(JSON.stringify(refreshed.messages)).not.toContain("Old draft");
+      current = JSON.parse(JSON.stringify(refreshed));
+      for (const [index, id] of ["root", "child"].entries())
+        current = applyMobileThreadEvent(current, {
+          type: "thread.message.updated",
+          seq: 904 + index,
+          payload: { messageId: `stored-${id}`, blocks: [native(id, "completed", 5 + index)] },
+        });
+      const restored = mergeMobileSnapshot(current, { ...interrupted, cursor: 906 }, history);
+      expect(restored.messages).toHaveLength(2);
+      expect(buildNativeSessionTrees(restored.messages)[0]?.nodes).toMatchObject([
+        { threadId: "root", status: "completed", nativeStatus: "completed", nativeRevision: 5 },
+        { threadId: "child", status: "completed", nativeStatus: "completed", nativeRevision: 6 },
+      ]);
+      const needsReview = applyMobileThreadEvent(restored, {
+        type: "thread.subagent",
+        seq: 907,
+        payload: native("child", "recovery_required", 7),
+      });
+      const stale = applyMobileThreadEvent(needsReview, {
+        type: "thread.subagent",
+        seq: 908,
+        payload: native("child", "completed", 6),
+      });
+      expect(buildNativeSessionTrees(stale?.messages ?? [])[0]?.nodes[1]).toMatchObject({
+        status: "failed",
+        nativeStatus: "recovery_required",
+        nativeRevision: 7,
+      });
+      const persisted = mergeMobileSnapshot(
+        stale,
+        {
+          ...interrupted,
+          cursor: 909,
+          messages: [
+            mobileMessage("stored-root", [native("root", "completed", 8)], 20),
+            mobileMessage("stored-child", [native("child", "recovery_required", 9)], 21),
+          ],
+        },
+        history,
+      );
+      expect(
+        buildNativeSessionTrees(persisted.messages)[0]?.nodes.map((node) => node.nativeRevision),
+      ).toEqual([8, 9]);
+      expect(
+        mergeMobileSnapshot(stale, { ...snapshot([]), cursor: 909 }, history).messages,
+      ).toEqual([]);
+      const other = { ...interrupted, threadId: "other-thread", cursor: 909 };
+      expect(mergeMobileSnapshot(stale, other, history)).toBe(other);
+    },
+  );
+
+  it("rejects a higher event seq with an older native revision and preserves a resumed revision across late persistence", () => {
+    const native = {
+      kind: "subagent" as const,
+      runtime: "codex" as const,
+      agentId: "native-child",
+      threadId: "native-child",
+      rootThreadId: "native-root",
+      parentThreadId: "native-root",
+      name: "Research",
+      task: "",
+      status: "completed" as const,
+      nativeRevision: 12,
+    };
+    const stored = snapshot([mobileMessage("stored", [native], 2)]);
+    const stale = applyMobileThreadEvent(stored, {
+      type: "thread.subagent",
+      seq: 900,
+      payload: { ...native, nativeRevision: 11, status: "running" },
+    });
+    expect(buildNativeSessionTrees(stale?.messages ?? [])[0]?.nodes[1]).toMatchObject({
+      status: "completed",
+      nativeRevision: 12,
+    });
+    const resumed = applyMobileThreadEvent(stale, {
+      type: "thread.subagent",
+      seq: 901,
+      payload: { ...native, nativeRevision: 13, status: "running" },
+    });
+    expect(resumed?.messages[0]?.seq).toBe(2);
+    const late = applyMobileThreadEvent(resumed, {
+      type: "thread.message.updated",
+      seq: 902,
+      payload: { messageId: "stored", blocks: [native] },
+    });
+    expect(late?.messages).toHaveLength(1);
+    expect(buildNativeSessionTrees(late?.messages ?? [])[0]?.nodes[1]).toMatchObject({
+      status: "running",
+      nativeRevision: 13,
+    });
+  });
 });

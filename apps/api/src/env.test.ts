@@ -13,9 +13,9 @@ describe("loadEnv", () => {
       expect(loadEnv({ ...base, TICKET_BOARD_ENABLED: value }).ticketBoardEnabled).toBe(false);
     expect(loadEnv({ ...base, TICKET_BOARD_ENABLED: "true" }).ticketBoardEnabled).toBe(true);
   });
-  it("defaults the product path to Pi, Docker, and Graphile Worker", () => {
+  it("defaults the product path to Codex, Docker, and Graphile Worker", () => {
     const env = loadEnv(base);
-    expect(env.agentRuntime).toBe("pi");
+    expect(env.agentRuntime).toBe("codex");
     expect(env.sandboxProvider).toBe("docker");
     expect(env.wakeupDriver).toBe("graphile");
     expect(env.apiHost).toBe("127.0.0.1");

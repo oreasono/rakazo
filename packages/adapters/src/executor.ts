@@ -78,6 +78,7 @@ import {
   messagingChannelId,
   messagingChannelPrivacyBlock,
   messagingDmSurfaceNote,
+  nativeSubagentMetadata,
   nextCronDateAcross,
   nextFence,
   planActionGate,
@@ -305,6 +306,7 @@ import { actorMayUsePrivateEndpoint } from "./private-endpoint.js";
 import type { RemoteTransportDependencies } from "./remote-mcp.js";
 import { assertSafeRemoteUrl } from "./remote-mcp.js";
 import { loadReplyContext, messageToAgentHistoryText } from "./reply-context.js";
+import { runRecoveryClaimFence } from "./run-recovery.js";
 import {
   commitConsumedRunSecret,
   normalizeSecretAskPurpose,
@@ -2723,6 +2725,26 @@ function toolResultError(result: unknown): unknown {
   return text || "tool reported an error result";
 }
 
+/** One execution's Activity writes must settle in order, even when output is streamed. */
+export function orderedComputerCommandPublisher(
+  append: (payload: ComputerCommand) => Promise<unknown>,
+  onError: (error: unknown) => void,
+): (payload: ComputerCommand) => Promise<void> {
+  let completed = false;
+  let pending = Promise.resolve();
+  return (payload) => {
+    if (completed && payload.status === "running") return pending;
+    if (payload.status === "done") completed = true;
+    pending = pending
+      .then(async () => {
+        await append(payload);
+      })
+      // Activity is a view; its write failure must not fail or repeat the operation.
+      .catch(onError);
+    return pending;
+  };
+}
+
 export function toolCompletionFromResult(
   base: Pick<AgentToolCompletion, "name" | "executionId" | "durationMs">,
   result: unknown,
@@ -2948,7 +2970,10 @@ export function isTerminalModelSetupError(error: unknown): boolean {
 }
 
 export function createRunExecutor(deps: ExecutorDeps) {
-  const contextStrategy = deps.contextStrategy ?? DEFAULT_CONTEXT_STRATEGY;
+  const codexOwned = deps.runtime?.describe?.().id === "codex";
+  const contextStrategy = codexOwned
+    ? "current"
+    : (deps.contextStrategy ?? DEFAULT_CONTEXT_STRATEGY);
   const web = deps.web ?? createWebProvider();
   const browser = deps.browser ?? createBrowserProvider(undefined, { sandbox: deps.sandbox });
   const cloudAgent = deps.cloudAgent;
@@ -3241,7 +3266,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
       }
     },
 
-    async continueRun(runId: string, workerId: string) {
+    async continueRun(runId: string, workerId: string, recoveryFence?: number) {
       const run = await deps.prisma.run.findUnique({ where: { id: runId } });
       if (!run) return;
       if (isTerminal(run.status as RunStatus)) return;
@@ -3254,6 +3279,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
         where: {
           id: runId,
           ...continueRunClaimFence(run),
+          AND: [runRecoveryClaimFence(recoveryFence, now)],
           OR: [
             { status: { in: ["queued", "waiting_input", "waiting_takeover"] } },
             {
@@ -3740,22 +3766,25 @@ export function createRunExecutor(deps: ExecutorDeps) {
         );
         let currentTurnFiles: Awaited<ReturnType<typeof materializeCurrentTurnFiles>>;
         try {
-          currentTurnFiles = deps.artifacts
-            ? await materializeCurrentTurnFiles(
-                {
-                  prisma: deps.prisma,
-                  artifacts: deps.artifacts,
-                  sandbox: deps.sandbox,
-                },
-                turnBlocks,
-                {
-                  context,
-                  computer,
-                  computerMode,
-                  markWorkspaceDirty: workspaceCheckpoint.markDirty,
-                },
-              )
-            : [];
+          // A resumed native run already owns its workspace. Re-materializing an
+          // attachment here can overwrite edits before the runtime recovery guard runs.
+          currentTurnFiles =
+            deps.artifacts && !(codexOwned && run.leaseFence > 0)
+              ? await materializeCurrentTurnFiles(
+                  {
+                    prisma: deps.prisma,
+                    artifacts: deps.artifacts,
+                    sandbox: deps.sandbox,
+                  },
+                  turnBlocks,
+                  {
+                    context,
+                    computer,
+                    computerMode,
+                    markWorkspaceDirty: workspaceCheckpoint.markDirty,
+                  },
+                )
+              : [];
         } catch (error) {
           await workspaceCheckpoint.flush().catch(() => undefined);
           throw error;
@@ -3817,6 +3846,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
         const pageBrowserAllowed =
           graphical && browser.describe().capabilities.page && !heldForTakeover;
         const disabledBuiltinTools = disabledBuiltinToolSet(bot.disabledBuiltinTools);
+        if (codexOwned) disabledBuiltinTools.add("run_subagent");
         const builtins = [
           ...selectBuiltinToolsForRun({
             ticketBoardEnabled: deps.ticketBoardEnabled,
@@ -3829,7 +3859,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
             cloudAgentEnabled: cloudAgentsEnabled(cloudAgent, run.spaceId),
             messagingChannelRun,
             voiceCall,
-            disabledBuiltinTools: bot.disabledBuiltinTools,
+            disabledBuiltinTools: [...disabledBuiltinTools],
           }),
           // Cross-owner agent connections only exist for chat-linked bots.
           ...(hasMessagingIdentity && !isBackgroundRunTrigger(run.trigger)
@@ -3905,6 +3935,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
         // messageSegments). Treat that like tool/step durable activity so we do not invent
         // an empty-run "done." completion afterward.
         let publishedTerminalSubagent = false;
+        const nativeProjectionKeys = new Map<string, string>();
         // Durable chat messages posted mid-turn (message_user / promoted narration).
         // Rehydrate from this run's prior progress rows so a resume after ask/takeover
         // still knows progress was already published (skip hollow finals; status outcome).
@@ -4639,18 +4670,18 @@ export function createRunExecutor(deps: ExecutorDeps) {
             runSecrets.push(...additions);
             progressRedactor = createStreamingRedactor(runSecrets);
           };
-          const appendComputerCommand = (payload: ComputerCommand) =>
-            deps.events
-              .append({
+          const appendComputerCommand = orderedComputerCommandPublisher(
+            (payload) =>
+              deps.events.append({
                 spaceId: run.spaceId,
                 threadId: thread.id,
                 botId: bot.id,
                 runId,
                 type: "computer.command",
                 payload,
-              })
-              // The Activity feed is a view; losing an entry must not fail the tool.
-              .catch((error: unknown) => getLogger().error("computer command event", error));
+              }),
+            (error) => getLogger().error("computer command event", error),
+          );
           /** Record a finished file/app action for the terminal's Activity view. */
           const recordComputerAction = (
             kind: Exclude<ComputerCommand["kind"], "shell">,
@@ -4996,6 +5027,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
                 deps.sandbox.execute(
                   computer,
                   {
+                    ...(codexOwned ? { operationId: executionId } : {}),
                     argv: [
                       "bash",
                       "-c",
@@ -5027,16 +5059,31 @@ export function createRunExecutor(deps: ExecutorDeps) {
                 },
               );
               if (observed.completion) {
-                const completion = observed.completion.then(async (final) => {
-                  clearPublishTimer();
-                  await appendComputerCommand({
-                    ...commandEvent,
-                    status: "done",
-                    exitCode: final.code,
-                    output: commandOutput(final, false).slice(-COMPUTER_COMMAND_OUTPUT_MAX_CHARS),
-                  });
-                  return final;
-                });
+                const completion = observed.completion.then(
+                  async (final) => {
+                    clearPublishTimer();
+                    await appendComputerCommand({
+                      ...commandEvent,
+                      status: "done",
+                      exitCode: final.code,
+                      output: commandOutput(final, false).slice(-COMPUTER_COMMAND_OUTPUT_MAX_CHARS),
+                    });
+                    return final;
+                  },
+                  async (error: unknown) => {
+                    clearPublishTimer();
+                    await appendComputerCommand({
+                      ...commandEvent,
+                      status: "done",
+                      exitCode: 1,
+                      output: redactSecrets(
+                        error instanceof Error ? error.message : "command failed",
+                        runSecrets,
+                      ).slice(-COMPUTER_COMMAND_OUTPUT_MAX_CHARS),
+                    });
+                    throw error;
+                  },
+                );
                 void completion.catch(() => undefined);
                 publishRunning(commandOutput(observed.result, true), true);
                 const returned = await finish({
@@ -6534,7 +6581,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
               })
                 .filter((instruction): instruction is string => Boolean(instruction))
                 .join("\n\n"),
-              history: runtimeHistory,
+              history: codexOwned ? [] : runtimeHistory,
               currentTurnImages,
               tools,
               model: {
@@ -6599,6 +6646,59 @@ export function createRunExecutor(deps: ExecutorDeps) {
               allowSilentEmpty: allowSilentEmptyRun,
               emptyResponseText,
               executeTool: scripted ? undefined : applyTool,
+              reconcileTool: codexOwned
+                ? async (name, _args, executionId) => {
+                    context.signal.throwIfAborted();
+                    if (name !== "shell" || !deps.sandbox.reconcileExecution)
+                      return { status: "unknown" as const };
+                    const receipt = await deps.sandbox.reconcileExecution(
+                      computer,
+                      executionId,
+                      context,
+                    );
+                    if (receipt.status !== "completed") return receipt;
+                    const result = {
+                      ...redactShellStreams(receipt.result, runSecrets, { withholdPartial: false }),
+                      code: receipt.result.code,
+                    };
+                    // Repair the existing Activity row from its already-redacted identity.
+                    // Never reconstruct command text from an old raw credential-bearing argument.
+                    const commandEvent = await deps.prisma.event.findFirst({
+                      where: {
+                        runId,
+                        type: "computer.command",
+                        payload: { path: ["executionId"], equals: executionId },
+                      },
+                      orderBy: { seq: "desc" },
+                      select: { payload: true },
+                    });
+                    if (
+                      commandEvent?.payload &&
+                      typeof commandEvent.payload === "object" &&
+                      !Array.isArray(commandEvent.payload)
+                    ) {
+                      await deps.events.append({
+                        spaceId: run.spaceId,
+                        threadId: thread.id,
+                        botId: bot.id,
+                        runId,
+                        type: "computer.command",
+                        payload: {
+                          ...commandEvent.payload,
+                          status: "done",
+                          exitCode: result.code,
+                          output: `${result.stdout}${result.stderr}`.slice(
+                            -COMPUTER_COMMAND_OUTPUT_MAX_CHARS,
+                          ),
+                        },
+                      });
+                    }
+                    return {
+                      status: "completed" as const,
+                      result,
+                    };
+                  }
+                : undefined,
               resolveModel: scripted
                 ? undefined
                 : (provider, modelId) =>
@@ -6949,6 +7049,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
                 }
               }
             } else if (event.type === "subagent") {
+              const native = nativeSubagentMetadata(event);
               const safeTask = redactSecrets(event.task, runSecrets);
               const safeProgress = event.progress
                 ? redactSecrets(event.progress, runSecrets)
@@ -6961,6 +7062,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
                 type: "thread.subagent",
                 runId,
                 payload: {
+                  ...native,
                   agentId: event.agentId,
                   name: event.name,
                   task: safeTask,
@@ -6969,7 +7071,41 @@ export function createRunExecutor(deps: ExecutorDeps) {
                   result: safeResult,
                 },
               });
-              if (event.status === "completed" || event.status === "failed") {
+              if (native) {
+                // Persist births and state/result changes so a refreshed client can
+                // rebuild the tree. Token-level progress remains in the event stream.
+                const projectionKey = JSON.stringify([
+                  event.status,
+                  event.name,
+                  safeTask,
+                  safeResult,
+                  native.parentThreadId,
+                  native.nativeStatus,
+                ]);
+                if (nativeProjectionKeys.get(event.agentId) !== projectionKey) {
+                  nativeProjectionKeys.set(event.agentId, projectionKey);
+                  await publishMessage(
+                    deps,
+                    run,
+                    "bot",
+                    [
+                      {
+                        kind: "subagent",
+                        ...native,
+                        agentId: event.agentId,
+                        name: event.name,
+                        task: safeTask,
+                        status: event.status,
+                        progress: safeProgress,
+                        result: safeResult,
+                      },
+                    ],
+                    false,
+                    `codex-node:${runId}:${event.agentId}:${event.nativeRevision ?? 0}`,
+                  );
+                }
+                if (event.status !== "running") publishedTerminalSubagent = true;
+              } else if (event.status === "completed" || event.status === "failed") {
                 publishedTerminalSubagent ||= !subagentMarksUnread(
                   run.trigger,
                   event.status,
@@ -6997,6 +7133,15 @@ export function createRunExecutor(deps: ExecutorDeps) {
                   ),
                 );
               }
+            } else if (event.type === "checkpoint" && codexOwned) {
+              await deps.events.append({
+                spaceId: run.spaceId,
+                threadId: thread.id,
+                botId: bot.id,
+                type: "run.checkpointed",
+                runId,
+                payload: JSON.parse(event.blob),
+              });
             } else if (event.type === "usage" && !event.accounted) {
               await recordUsage(deps.prisma, event, {
                 spaceId: run.spaceId,
@@ -7172,6 +7317,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
               },
             });
             if (
+              !codexOwned &&
               contextStrategy === "current" &&
               shouldEnqueueCompaction(
                 updatedThread.nextMessageSeq,
@@ -7438,12 +7584,14 @@ async function renewRunLease(
   workerId: string,
   fence: number,
 ): Promise<boolean> {
+  const now = new Date();
   const renewed = await deps.prisma.run.updateMany({
     where: {
       id: runId,
       status: "running",
       leaseOwner: workerId,
       leaseFence: fence,
+      leaseExpiresAt: { gt: now },
     },
     data: { leaseExpiresAt: new Date(Date.now() + 5 * 60_000) },
   });

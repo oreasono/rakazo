@@ -14,7 +14,7 @@ vi.mock("@lingui/react/macro", () => {
   return { useLingui: () => ({ t }), Trans: ({ children }: { children: ReactNode }) => children };
 });
 
-import { Composer } from "./Shell";
+import { Composer, Transcript } from "./Shell";
 
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
@@ -36,6 +36,103 @@ const summarize: AgentSkillCatalogEntry = {
   source: "user",
   readOnly: false,
 };
+
+describe("Transcript native sessions", () => {
+  it("keeps the tree outside the scrolling viewport and native cards out of mixed messages", () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const scrollRef = createRef<HTMLDivElement>();
+    // jsdom has no scrolling implementation; the transcript still follows its tail on mount.
+    HTMLElement.prototype.scrollTo ??= () => {};
+    const node = (id: string) => ({
+      kind: "subagent" as const,
+      runtime: "codex" as const,
+      rootThreadId: "native-root",
+      threadId: id,
+      agentId: id,
+      parentThreadId: id === "native-root" ? null : "native-root",
+      name: id,
+      task: "Internal native prompt",
+      result: "Internal native result",
+      status: "completed" as const,
+    });
+    const messages: ThreadMessage[] = [
+      {
+        id: "native-only",
+        seq: 1,
+        threadId: "thread",
+        role: "bot",
+        createdAt: "2026-01-01T00:00:00Z",
+        blocks: [node("native-root")],
+      },
+      {
+        id: "mixed",
+        seq: 2,
+        threadId: "thread",
+        role: "bot",
+        createdAt: "2026-01-01T00:00:01Z",
+        blocks: [
+          node("native-child"),
+          { kind: "text", text: "Visible reply" },
+          {
+            kind: "subagent",
+            agentId: "legacy-task",
+            name: "Legacy task",
+            task: "Legacy prompt",
+            status: "completed",
+          },
+        ],
+      },
+    ];
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    act(() =>
+      root?.render(
+        <Transcript
+          scrollRef={scrollRef}
+          scrollRequest={null}
+          onScrollRequestHandled={() => {}}
+          artifactTarget={{ botId: "bot" }}
+          messages={messages}
+          showToolActivity={true}
+          olderCursor={null}
+          loadingOlder={false}
+          answerableAskMessageId={null}
+          running={false}
+          workingBots={[]}
+          onLoadOlder={() => {}}
+          onOpenBot={() => {}}
+          onAnswer={async () => {}}
+          onReply={() => {}}
+          onQuote={() => {}}
+          onReact={async () => {}}
+          onJumpToMessage={() => {}}
+          onOpenPeerMessages={() => {}}
+          peerBot={() => undefined}
+          onRefresh={async () => {}}
+          onBotChanged={async () => {}}
+          onAddRoutine={() => {}}
+          voiceReady={false}
+          speakingMessageId={null}
+          onSpeak={() => {}}
+          onOpenComputer={() => {}}
+        />,
+      ),
+    );
+    const viewport = scrollRef.current;
+    const panel = container.querySelector('[data-testid="native-session-panel"]');
+    expect(panel).not.toBeNull();
+    expect(viewport?.contains(panel)).toBe(false);
+    expect(panel?.parentElement).toBe(viewport?.parentElement);
+    expect(panel?.querySelector("details")?.open).toBe(true);
+    expect(panel?.textContent).toContain("native-root");
+    expect(panel?.textContent).toContain("native-child");
+    expect(viewport?.querySelector('[data-message-id="native-only"]')).toBeNull();
+    expect(viewport?.textContent).toContain("Visible reply");
+    expect(viewport?.textContent).toContain("Legacy prompt");
+    expect(container.textContent).not.toContain("Internal native");
+  });
+});
 
 function renderComposer(
   onSend: ComponentProps<typeof Composer>["onSend"],

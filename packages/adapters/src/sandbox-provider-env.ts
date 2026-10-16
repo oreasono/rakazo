@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import type { IncusSandboxOptions } from "./incus-sandbox.js";
 import type { SandboxProviderOptions } from "./sandbox-factory.js";
 
 /** Empty or remote provider without a key becomes none so services can boot for signup. */
@@ -44,8 +46,12 @@ export function sandboxProviderOptionsFromEnv(
   | "railwayMaxWorkspaceFileBytes"
   | "boxApiKey"
   | "boxApiUrl"
+  | "incus"
 > {
   return {
+    incus: source.INCUS_CONFIG_FILE
+      ? (JSON.parse(readFileSync(source.INCUS_CONFIG_FILE, "utf8")) as IncusSandboxOptions)
+      : undefined,
     e2bApiKey: source.E2B_API_KEY,
     daytonaApiKey: source.DAYTONA_API_KEY,
     daytonaApiUrl: source.DAYTONA_API_URL,

@@ -7,6 +7,7 @@ loadRootEnv();
 
 import {
   ChatSdkMessagingSurface,
+  CodexAgentRuntime,
   CodexCatalogCache,
   createBackgroundJobHandlers,
   createCloudAgentConnection,
@@ -34,14 +35,12 @@ import {
   McpOAuthBroker,
   messagingEnvFromProcess,
   messagingPlatformsFromEnv,
-  PiAgentRuntime,
   PipedreamConnector,
   PostgresRealtimeFanout,
   pipedreamConfigFromEnv,
   reconcileCloudAgents,
   reconcileComputerUpdates,
   resolveDeploymentModel,
-  resolvePiSessionRoot,
   resolveSandboxProvider,
   ScriptedAgentRuntime,
   SpaceMemoryProviderResolver,
@@ -94,7 +93,10 @@ async function main() {
   const runtime =
     process.env.AGENT_RUNTIME === "scripted"
       ? new ScriptedAgentRuntime()
-      : new PiAgentRuntime({ sessionRoot: resolvePiSessionRoot(dataDir) });
+      : new CodexAgentRuntime({
+          sessionRoot: `${dataDir}/codex-sessions`,
+          binary: process.env.CODEX_BINARY,
+        });
   // Same resolver the API uses, so both processes agree on provider, model and key.
   const { key: deploymentModelKey, configured: deploymentModelConfigured } =
     resolveDeploymentModel();

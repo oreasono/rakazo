@@ -1,4 +1,4 @@
-import type { MessageBlock } from "@rakazo/contracts";
+import type { ComputerCommand, MessageBlock } from "@rakazo/contracts";
 import { CLOUDFLARE_AI_GATEWAY_CONFIG_MESSAGE } from "@rakazo/contracts";
 import { ONCE_ROUTINE_CRON } from "@rakazo/core";
 import type { PrismaClient } from "@rakazo/db";
@@ -11,6 +11,7 @@ import {
   isTerminalModelSetupError,
   loadCurrentTurnImages,
   missingTurnImagesInstruction,
+  orderedComputerCommandPublisher,
   parseUpdateBotPatch,
   persistentComputerInstruction,
   runNotificationsEnabled,
@@ -26,6 +27,59 @@ import {
 } from "./executor.js";
 import { UnavailableModelForAuthError } from "./model-selection.js";
 import { RetiredModelCredentialError, serializeModelSecret } from "./pi-oauth.js";
+
+describe("ordered command Activity", () => {
+  const payload = (status: "running" | "done"): ComputerCommand => ({
+    executionId: "operation-1",
+    kind: "shell",
+    command: "test command",
+    cwd: ".",
+    status,
+    exitCode: status === "done" ? 0 : null,
+    output: "output",
+  });
+
+  it("waits for an in-flight output append before committing completion", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const committed: string[] = [];
+    const append = vi.fn(async (value: ComputerCommand) => {
+      if (value.status === "running") await gate;
+      committed.push(value.status);
+    });
+    const publish = orderedComputerCommandPublisher(append, vi.fn());
+    void publish(payload("running"));
+    const done = publish(payload("done"));
+    await Promise.resolve();
+    expect(append).toHaveBeenCalledTimes(1);
+    release();
+    await done;
+    expect(committed).toEqual(["running", "done"]);
+  });
+
+  it("ignores a delayed output callback once completion has been requested", async () => {
+    const append = vi.fn(async (_value: ComputerCommand) => undefined);
+    const publish = orderedComputerCommandPublisher(append, vi.fn());
+    const done = publish(payload("done"));
+    await publish(payload("running"));
+    await done;
+    expect(append).toHaveBeenCalledTimes(1);
+    expect(append.mock.calls[0]?.[0]).toEqual(payload("done"));
+  });
+
+  it("still commits completion after a failed streaming view append", async () => {
+    const error = new Error("view unavailable");
+    const append = vi.fn().mockRejectedValueOnce(error).mockResolvedValueOnce(undefined);
+    const onError = vi.fn();
+    const publish = orderedComputerCommandPublisher(append, onError);
+    void publish(payload("running"));
+    await expect(publish(payload("done"))).resolves.toBeUndefined();
+    expect(onError).toHaveBeenCalledWith(error);
+    expect(append).toHaveBeenLastCalledWith(payload("done"));
+  });
+});
 
 describe("bot tool permissions", () => {
   it("never lets self-edit change disabled tools alongside an allowed field", () => {

@@ -15,6 +15,7 @@ import {
   appendNewerThreadPage,
   attachmentsForThread,
   buildComposerMentionOptions,
+  buildNativeSessionTrees,
   cloudAgentHttpsUrl,
   formatFileSize,
   formatMessageTime,
@@ -38,6 +39,7 @@ import {
   timeSeparatorIds,
   userVisibleMessages,
   withLiveStreamingProgress,
+  withoutNativeSessionBlocks,
 } from "@rakazo/core";
 import * as Clipboard from "expo-clipboard";
 import {
@@ -102,6 +104,7 @@ import { MarkdownArtifactPreview } from "../components/markdown-artifact-preview
 import { MessageCaption } from "../components/message-caption";
 import { MessageContextMenu } from "../components/message-context-menu";
 import { NativeActionButton } from "../components/native-action-button";
+import { NativeSessionTrees } from "../components/native-session-tree";
 import { NativeSymbol } from "../components/native-symbol";
 import { ReplyDismissButton } from "../components/reply-dismiss-button";
 import { ReplyLine } from "../components/reply-line";
@@ -599,7 +602,9 @@ function Thread({ sessionEpoch }: { sessionEpoch: number }) {
   const reactionView = useMemo(
     () =>
       projectMessageReactions(
-        userVisibleMessages(snap?.messages ?? [], { includePeerReceipts: true })
+        userVisibleMessages(withoutNativeSessionBlocks(snap?.messages ?? []), {
+          includePeerReceipts: true,
+        })
           .map((message) => {
             const dismissed = dismissedChoiceQuestions.get(message.id);
             if (!dismissed) return message;
@@ -611,6 +616,12 @@ function Thread({ sessionEpoch }: { sessionEpoch: number }) {
     [dismissedChoiceQuestions, snap?.messages],
   );
   const visibleMessages = reactionView.visibleMessages;
+  const nativeTrees = useMemo(
+    () => buildNativeSessionTrees(snap?.messages ?? []),
+    [snap?.messages],
+  );
+  // A fixed session panel clears the transparent header for the transcript too.
+  const transcriptTopInset = nativeTrees.length ? 0 : headerHeight;
   const latestMessageId = visibleMessages.at(-1)?.id ?? null;
   const activePendingAttachments = attachmentsForThread(pendingAttachments, threadKey);
   const composerRef = useRef<ThreadComposerHandle>(null);
@@ -1959,7 +1970,7 @@ function Thread({ sessionEpoch }: { sessionEpoch: number }) {
     if (jumpAnchor.current.holds() && !targetDrawn) {
       jumpAnchor.current.release();
       jumpScrollTarget.current = null;
-    } else if (jumpAnchor.current.blocksPaging(targetDrawn, headerHeight + 24)) {
+    } else if (jumpAnchor.current.blocksPaging(targetDrawn, transcriptTopInset + 24)) {
       return;
     }
     const { offset, viewport, content } = pinnedScrollMetrics.current;
@@ -2038,14 +2049,19 @@ function Thread({ sessionEpoch }: { sessionEpoch: number }) {
       });
     },
     layout: (messageId, y, index) => {
-      const offset = jumpAnchor.current.onMessageLayout(messageId, y, index, headerHeight + 24);
+      const offset = jumpAnchor.current.onMessageLayout(
+        messageId,
+        y,
+        index,
+        transcriptTopInset + 24,
+      );
       if (offset == null) return;
       scrollPinnedTo(offset);
       setHighlightedMessageId(messageId);
       if (highlightTimer.current) clearTimeout(highlightTimer.current);
       highlightTimer.current = setTimeout(() => setHighlightedMessageId(null), 1200);
       requestAnimationFrame(() => {
-        const again = jumpAnchor.current.align(headerHeight + 24);
+        const again = jumpAnchor.current.align(transcriptTopInset + 24);
         if (again != null) scrollPinnedTo(again);
       });
     },
@@ -2169,10 +2185,10 @@ function Thread({ sessionEpoch }: { sessionEpoch: number }) {
   );
   const listContentStyle = useMemo(
     () => ({
-      paddingBottom: headerHeight + 8,
+      paddingBottom: transcriptTopInset + 8,
       paddingTop: readOnly ? insets.bottom + 16 : 16,
     }),
-    [headerHeight, readOnly, insets.bottom],
+    [transcriptTopInset, readOnly, insets.bottom],
   );
 
   const workingFooter =
@@ -2272,13 +2288,18 @@ function Thread({ sessionEpoch }: { sessionEpoch: number }) {
         </Text>
       ) : null}
       {/* The floor keeps a tall suggestion list from sliding under the transparent header. */}
-      <View style={{ flex: 1, minHeight: headerHeight, position: "relative" }}>
+      {nativeTrees.length ? (
+        <View style={{ flexShrink: 0, paddingTop: error || runError ? 8 : headerHeight + 8 }}>
+          <NativeSessionTrees trees={nativeTrees} />
+        </View>
+      ) : null}
+      <View style={{ flex: 1, minHeight: transcriptTopInset, position: "relative" }}>
         {showPinnedPage ? (
           <ScrollView
             key={jumpScrollTarget.current ?? pinnedTarget?.messageId ?? threadKey}
             ref={pinnedScroll}
             style={{ flex: 1 }}
-            contentContainerStyle={{ paddingTop: headerHeight + 8, paddingBottom: 16 }}
+            contentContainerStyle={{ paddingTop: transcriptTopInset + 8, paddingBottom: 16 }}
             maintainVisibleContentPosition={messageListPosition}
             scrollEventThrottle={16}
             onLayout={(event) => {
@@ -2287,7 +2308,7 @@ function Thread({ sessionEpoch }: { sessionEpoch: number }) {
             }}
             onContentSizeChange={(_, height) => {
               pinnedScrollMetrics.current.content = height;
-              const jumpOffset = jumpAnchor.current.align(headerHeight + 24);
+              const jumpOffset = jumpAnchor.current.align(transcriptTopInset + 24);
               if (jumpOffset != null) scrollPinnedTo(jumpOffset);
               const armedAt = joinPinnedAfterLayout.current;
               if (armedAt != null && height !== armedAt) {
@@ -2441,7 +2462,10 @@ function Thread({ sessionEpoch }: { sessionEpoch: number }) {
       </View>
       {/* Fades messages out under the transparent header; the alpha stop keeps the page hue. */}
       {iosAtLeast(26) ? (
-        <View pointerEvents="none" style={[styles.headerFade, { height: headerHeight + 24 }]} />
+        <View
+          pointerEvents="none"
+          style={[styles.headerFade, { height: headerHeight + (nativeTrees.length ? 0 : 24) }]}
+        />
       ) : null}
       {/* Shrinks (the suggestion lists scroll) so the input and Send stay above the keyboard. */}
       <View

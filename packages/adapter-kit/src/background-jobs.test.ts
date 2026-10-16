@@ -6,6 +6,7 @@ import {
   historyCompactJobKey,
   messagingDeliverJob,
   parseBackgroundJob,
+  runRecoveryJob,
 } from "./background-jobs.js";
 import type { BackgroundJobHandlers } from "./types.js";
 
@@ -24,6 +25,27 @@ function handlers(): BackgroundJobHandlers {
 }
 
 describe("background job contracts", () => {
+  it("preserves the run and expired fence through recovery dispatch", async () => {
+    const target = handlers();
+    const job = runRecoveryJob("run-1", 7);
+    expect(job).toEqual({
+      name: "run.continue",
+      payload: { runId: "run-1", recoveryFence: 7 },
+      replaceKey: "run:run-1:recovery:7",
+      keepExisting: true,
+    });
+    await dispatchBackgroundJob(target, job.name, job.payload);
+    expect(target["run.continue"]).toHaveBeenCalledWith({ runId: "run-1", recoveryFence: 7 });
+    expect(runRecoveryJob("run-1", 8).replaceKey).not.toBe(job.replaceKey);
+  });
+
+  it.each([-1, 1.5, "7", null, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects an invalid recovery fence: %s",
+    (recoveryFence) => {
+      expect(() => parseBackgroundJob("run.continue", { runId: "run-1", recoveryFence })).toThrow();
+    },
+  );
+
   it("validates and dispatches messaging.deliver", async () => {
     const target = handlers();
     await dispatchBackgroundJob(target, "messaging.deliver", { runId: "run-1" });
