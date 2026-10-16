@@ -7,6 +7,7 @@ import { recordUsage } from "@rakazo/db";
 import { describe, expect, it } from "vitest";
 import { runAutoReviewJudge } from "../../adapters/src/auto-review.js";
 import { compactHistory } from "../../adapters/src/history-compaction.js";
+import { PiAgentRuntime } from "../../adapters/src/pi-runtime.js";
 import { discardBotIntroRun } from "./discard-bot-intro.js";
 import { sessionCookieHeader } from "./index.js";
 import { startModelEmulator } from "./model-emulator.js";
@@ -91,6 +92,8 @@ describe.skipIf(!enabled)("persisted Pi usage accounting", () => {
         dataDir,
         sandboxProvider: "fake",
         agentRuntime: "pi",
+        // Legacy Pi fixture: production non-scripted selection is Codex.
+        runtime: new PiAgentRuntime(),
         contextStrategy: "current",
         wakeupDriver: "memory",
         signupsEnabled: "true",

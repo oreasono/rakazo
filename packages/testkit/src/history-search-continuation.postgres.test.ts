@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { HistorySearchInput } from "@rakazo/contracts";
 import { describe, expect, it } from "vitest";
+import { PiAgentRuntime } from "../../adapters/src/pi-runtime.js";
 import { historyFixture } from "./evals/history-fixtures.js";
 import { runTrial } from "./evals/runner.js";
 import { type ModelEmulatorRequest, startModelEmulator } from "./model-emulator.js";
@@ -182,6 +183,8 @@ describe.skipIf(!enabled)("unfinished broad history search", () => {
                 dataDir,
                 sandboxProvider: "fake",
                 agentRuntime: "pi",
+                // Legacy Pi fixture: production non-scripted selection is Codex.
+                runtime: new PiAgentRuntime(),
                 wakeupDriver: "memory",
                 signupsEnabled: "true",
                 composio,

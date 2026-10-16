@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { PiAgentRuntime } from "../../adapters/src/pi-runtime.js";
 import { EVAL_CASES } from "./evals/cases.js";
 import { runTrial } from "./evals/runner.js";
 import { EvalSandboxProvider } from "./evals/sandbox.js";
@@ -93,6 +94,8 @@ describe.skipIf(!databaseAvailable)("offline Slack customer-support eval", () =>
             dataDir,
             sandboxProvider: "fake",
             agentRuntime: "pi",
+            // Legacy Pi fixture: production non-scripted selection is Codex.
+            runtime: new PiAgentRuntime(),
             wakeupDriver: "memory",
             signupsEnabled: "true",
             composio,

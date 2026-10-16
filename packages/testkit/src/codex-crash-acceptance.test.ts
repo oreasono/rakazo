@@ -19,7 +19,9 @@ it.skipIf(process.platform === "win32")(
       expect(bytes.length).toBe(nonce.length + 1);
       expect(bytes.at(-1)).toBe(10);
       requireAppendCount(bytes.toString("utf8"), nonce, 1);
-      expect(task.prompt).toContain(`${task.command}\nDo not`);
+      expect(task.prompt).toContain(
+        `Pass this exact command as its command argument: ${task.command}\n`,
+      );
       execFileSync("/bin/bash", ["-c", task.command], { stdio: "ignore", timeout: 5_000 });
       expect(readFileSync(file, "utf8")).toBe(`${nonce}\n${nonce}\n`);
       expect(() => requireAppendCount(readFileSync(file, "utf8"), nonce, 1)).toThrow();
