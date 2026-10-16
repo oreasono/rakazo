@@ -64,6 +64,7 @@ import {
   connectorKindFromToolName,
   containsSecret,
   createStreamingRedactor,
+  DEFAULT_AGENT_KNOWLEDGE,
   endsSentence,
   expandSkillReferencesInPrompt,
   formatSkillRunPrompt,
@@ -7925,6 +7926,7 @@ export function userTurnInstructions(parts: {
 }): (string | undefined)[] {
   return [
     parts.botInstructions,
+    DEFAULT_AGENT_KNOWLEDGE,
     parts.historyRetrievalEnabled &&
     builtinOffered(parts.disabledBuiltinTools, "search_history") &&
     builtinOffered(parts.disabledBuiltinTools, "read_history")

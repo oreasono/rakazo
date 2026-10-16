@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { CodexAgentRuntime, ComposioEmulator } from "@rakazo/adapters";
 import type { ThreadSnapshot } from "@rakazo/contracts";
-import { buildNativeSessionTrees } from "@rakazo/core";
+import { buildNativeSessionTrees, DEFAULT_AGENT_KNOWLEDGE } from "@rakazo/core";
 import { describe, expect, it } from "vitest";
 import type { CodexConnectionOptions, CodexObject } from "../../adapters/src/codex-app-server.js";
 import { CodexAppServer } from "../../adapters/src/codex-app-server.js";
@@ -42,6 +42,7 @@ describe.skipIf(!enabled)("offline Codex product journey", () => {
             async request(method: string, params: CodexObject): Promise<CodexObject> {
               if (method === "thread/start") {
                 expect(params.model).toBe(model.model.id);
+                expect(params.developerInstructions).toContain(DEFAULT_AGENT_KNOWLEDGE);
                 return { thread: { id: "fixture-native-root", turns: [] } };
               }
               if (method !== "turn/start") return {};

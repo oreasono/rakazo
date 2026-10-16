@@ -1,6 +1,6 @@
 import type { ComputerCommand, MessageBlock } from "@rakazo/contracts";
 import { CLOUDFLARE_AI_GATEWAY_CONFIG_MESSAGE } from "@rakazo/contracts";
-import { ONCE_ROUTINE_CRON } from "@rakazo/core";
+import { DEFAULT_AGENT_KNOWLEDGE, ONCE_ROUTINE_CRON } from "@rakazo/core";
 import type { PrismaClient } from "@rakazo/db";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -1112,6 +1112,7 @@ describe("userTurnInstructions", () => {
 
     expect(instructions).toEqual([
       "Bot instructions",
+      DEFAULT_AGENT_KNOWLEDGE,
       computerLine,
       "This entire computer workspace is your private home.",
       "Agent environment",
@@ -1147,6 +1148,7 @@ describe("userTurnInstructions", () => {
 
     expect(instructions).toEqual([
       "Bot instructions",
+      DEFAULT_AGENT_KNOWLEDGE,
       computerLine,
       "This entire computer workspace is your private home.",
       ...stableMiddle,
@@ -1175,6 +1177,7 @@ describe("userTurnInstructions", () => {
 
     expect(instructions).toEqual([
       "Bot instructions",
+      DEFAULT_AGENT_KNOWLEDGE,
       computerLine,
       "Catalog guidance",
       "This entire computer workspace is your private home.",
