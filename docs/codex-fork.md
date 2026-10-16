@@ -1,11 +1,15 @@
 # Codex runtime and self-hosted computers
 
-Status: initial live chain accepted, 2026-10-16. The real API and independent worker
+Status: live chain and scoped worker-crash recovery accepted, 2026-10-16. The real API and independent worker
 delegated to a native Codex child on a temporary Incus Ubuntu VM, verified its nonce
 through external readback, and retained the same native root after restarting the
 worker between completed turns. The real web root/child tree was visually verified
-in the viewport before and after refresh, with matching tree-image hashes. Mid-turn crash replay,
-native app sessions and other operating systems remain outside this acceptance.
+in the viewport before and after refresh. Three command-operation crash windows
+were also accepted using real worker SIGKILL and independent VM readback. Each
+recovered the original run and native IDs with exactly one file append. API/web
+cold restart and fresh browser login retained the recovered tree and states.
+Arbitrary GUI transactions, VM power loss, native apps and other guest operating
+systems remain outside this acceptance.
 See [current status and configuration](codex-fork-status.md).
 No fork release or live Codex voice acceptance is available. Preserve the upstream
 Apache-2.0 license and attribution.
@@ -66,9 +70,12 @@ through this fork's real API/worker, beyond the earlier separate PAC integration
 - Preserve a stable Codex thread and its state directory across worker restarts.
   UI transcripts are projections; do not resubmit old messages as new prompts.
   The current adapter stores bindings under `DATA_DIR/codex-sessions`. The first
-  live recovery gate restarts the worker between two completed turns. An admitted
-  run whose outcome is ambiguous after a crash is refused automatic replay; a new
-  user message can resume the same conversation after the operator checks its state.
+  live recovery gate covered a restart between completed turns; a later gate
+  covered three mid-turn command crash windows. A durable controller journal and
+  VM execution receipt distinguish prepared, dispatched and completed operations.
+  A dispatched operation is never automatically resent. Unknown outcomes block
+  new mutations; reporting-only recovery cannot dispatch new child work or tools.
+  Operator resolution of genuinely unknown outcomes has no product UI yet.
 - Route events by thread/turn/request ID. A child event is not a root-thread
   identity error. Only accept descendants established by trusted runtime events.
 - Keep pending approvals bound to the original request and process connection.
@@ -138,8 +145,11 @@ connection material appropriate to their transport.
 1. **Codex + Ubuntu through Rakazo.** Native delegation, guest tool marker write,
    independent readback, durable/web tree identity and same-root worker recovery
    between completed turns passed on 2026-10-16. Viewport tree screenshots before
-   and after refresh were visually accepted. Approval/interruption recovery and hard-crash handling without
-   duplicated effects are still separate, unaccepted cases.
+   and after refresh were visually accepted. Three worker SIGKILL windows now also
+   pass: before dispatch, after VM execution before result receipt, and after
+   durable result storage before returning it to Codex. Every command appended
+   exactly once. Approval recovery, arbitrary GUI effects and VM power loss are
+   separate, unaccepted cases.
 2. **Mixed computers.** One root delegates work to Ubuntu, macOS and Windows.
    Independently read back each artifact; test routing, screen input, takeover,
    locked/logged-out desktops and unavailable capabilities.
@@ -147,8 +157,9 @@ connection material appropriate to their transport.
    produces audible output, accepts interruption, delegates a task and reports its
    result while conversation continues. Verify disconnect/reconnect and both text
    and voice steering. Do not substitute transcription-plus-TTS for this gate.
-4. **Client recovery.** Web, desktop and mobile reconnect to consistent state after
-   client, worker or VM restarts. Verify no duplicated tasks, approvals or writes.
+4. **Client recovery.** The real web client passed refresh and API/web cold restart
+   with fresh login after worker-crash recovery. Native desktop/mobile sessions,
+   approval recovery and VM restarts still need their own acceptance.
 
 ## Reproduce the narrow protocol check
 

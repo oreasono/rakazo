@@ -1,7 +1,7 @@
 /** Probe the installed app-server without running a model turn or a voice call. */
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -104,19 +104,30 @@ try {
   const methods = methodNames(await schema(schemaDir, "ClientRequest"));
   const notifications = methodNames(await schema(schemaDir, "ServerNotification"));
   const required = [
-    "thread/start", "thread/resume", "thread/fork", "turn/start", "turn/interrupt",
-    "thread/realtime/start", "thread/realtime/appendAudio",
-    "thread/realtime/appendText", "thread/realtime/stop", "thread/realtime/listVoices",
+    "thread/start",
+    "thread/resume",
+    "thread/fork",
+    "turn/start",
+    "turn/interrupt",
+    "thread/realtime/start",
+    "thread/realtime/appendAudio",
+    "thread/realtime/appendText",
+    "thread/realtime/stop",
+    "thread/realtime/listVoices",
   ];
   for (const method of required) assert.ok(methods.has(method), `Missing method: ${method}`);
   const realtime = await schema(schemaDir, "ThreadRealtimeStartParams");
-  const transports = realtime.definitions?.ThreadRealtimeStartTransport?.oneOf
-    ?.flatMap((variant) => variant.properties?.type?.enum ?? []) ?? [];
+  const transports =
+    realtime.definitions?.ThreadRealtimeStartTransport?.oneOf?.flatMap(
+      (variant) => variant.properties?.type?.enum ?? [],
+    ) ?? [];
   assert.ok(transports.includes("websocket"), "Missing websocket realtime transport");
   assert.ok(transports.includes("webrtc"), "Missing WebRTC realtime transport");
 
   child = spawn(binary, ["app-server", "--listen", "stdio://"], {
-    cwd: root, env, stdio: ["pipe", "pipe", "ignore"],
+    cwd: root,
+    env,
+    stdio: ["pipe", "pipe", "ignore"],
   });
   child.on("error", failPending);
   child.on("exit", failPending);
@@ -124,7 +135,12 @@ try {
   lines = createInterface({ input: child.stdout });
   lines.on("line", (line) => {
     let message;
-    try { message = JSON.parse(line); } catch { failPending(); return; }
+    try {
+      message = JSON.parse(line);
+    } catch {
+      failPending();
+      return;
+    }
     if (message.method) {
       if (message.id !== undefined) {
         // This probe cannot authorize tools, commands, or approvals.
@@ -150,15 +166,37 @@ try {
   assert.ok(first.thread?.id && second.thread?.id, "Missing thread IDs");
   assert.notEqual(first.thread.id, second.thread.id);
   const voices = await request("thread/realtime/listVoices", {});
-  assert.ok(voices?.voices?.v1?.length && voices?.voices?.v2?.length, "Missing voice catalog entries");
-  console.log(JSON.stringify({
-    version,
-    passed: true,
-    protocol: { methods: required, realtimeTransports: transports,
-      realtimeNotifications: [...notifications].filter((name) => name.startsWith("thread/realtime/")) },
-    exercised: { initialize: true, twoIndependentThreads: true, listVoices: true },
-    notExercised: ["modelTurn", "nativeSubagent", "persistedResume", "threadFork", "browserUse", "computerUse", "liveVoice"],
-  }, null, 2));
+  assert.ok(
+    voices?.voices?.v1?.length && voices?.voices?.v2?.length,
+    "Missing voice catalog entries",
+  );
+  console.log(
+    JSON.stringify(
+      {
+        version,
+        passed: true,
+        protocol: {
+          methods: required,
+          realtimeTransports: transports,
+          realtimeNotifications: [...notifications].filter((name) =>
+            name.startsWith("thread/realtime/"),
+          ),
+        },
+        exercised: { initialize: true, twoIndependentThreads: true, listVoices: true },
+        notExercised: [
+          "modelTurn",
+          "nativeSubagent",
+          "persistedResume",
+          "threadFork",
+          "browserUse",
+          "computerUse",
+          "liveVoice",
+        ],
+      },
+      null,
+      2,
+    ),
+  );
 } catch (error) {
   console.error(error.message);
   process.exitCode = 1;
@@ -167,8 +205,13 @@ try {
   failPending();
   if (child && child.exitCode === null && child.signalCode === null && child.pid) {
     await new Promise((resolve) => {
-      const timer = setTimeout(() => { child.kill("SIGKILL"); }, 2_000);
-      child.once("exit", () => { clearTimeout(timer); resolve(); });
+      const timer = setTimeout(() => {
+        child.kill("SIGKILL");
+      }, 2_000);
+      child.once("exit", () => {
+        clearTimeout(timer);
+        resolve();
+      });
       child.kill("SIGTERM");
     });
   }

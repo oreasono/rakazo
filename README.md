@@ -1,11 +1,14 @@
 # Rakazo
 
-> **Codex fork — initial live chain accepted (2026-10-16).** A real product API/worker
+> **Codex fork — live chain and scoped crash recovery accepted (2026-10-16).** A real product API/worker
 > run delegated to a native Codex child on a temporary Incus Ubuntu VM, verified the
 > result independently, and resumed the same native root after a worker restart
 > between completed turns. The real web root/child tree was visually verified
-> before and after refresh, with matching screenshot hashes. This does not establish
-> mid-turn crash replay, native mobile/desktop app acceptance or realtime voice.
+> before and after refresh. Three worker SIGKILL windows also recovered the same run
+> and native tree with exactly one independently verified VM file append each.
+> API/web cold restart and fresh browser login preserved the recovered tree and states.
+> This does not establish arbitrary GUI transaction recovery, VM power-loss recovery,
+> native mobile/desktop app acceptance or realtime voice.
 > See [current status and configuration](docs/codex-fork-status.md)
 > and [architecture](docs/codex-fork.md). The published downloads below are upstream
 > Rakazo releases; they do not contain this fork's changes.
@@ -17,6 +20,9 @@ set `SANDBOX_PROVIDER=incus` and `INCUS_CONFIG_FILE` on both API and worker. Kee
 `RAKAZO_OPENAI_COMPAT_ALLOW_PUBLIC=1`; configure credentials through the product's
 OpenAI-compatible connection. See the [isolated live acceptance instructions](scripts/accept-codex-incus.md).
 macOS/Windows backends and Codex realtime voice integration remain planned.
+
+Fork server image publishing and mobile OTA are disabled until explicitly enabled. See
+[fork publishing opt-ins](docs/fork-publishing.md) before configuring release credentials.
 
 [![GitHub stars](https://img.shields.io/github/stars/elie222/rakazo?labelColor=black&style=for-the-badge&color=2563EB)](https://github.com/elie222/rakazo/stargazers)
 [![Discord](https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?labelColor=black&style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/RWwKa2Sn7h)

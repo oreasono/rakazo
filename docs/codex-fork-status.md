@@ -14,8 +14,25 @@ tree-image hashes before and after refresh. The images were visually reviewed an
 accepted. This follow-up reused the completed runs and made no new model calls;
 the original run receipt and earlier screenshots remain preserved.
 
-This acceptance does **not** cover automatic replay of a turn interrupted by a hard
-crash, real native mobile/Electron app sessions, voice, macOS or Windows computers.
+Three later real worker SIGKILL cases passed the command-recovery gate:
+
+| Crash window | Independently observed effect | Recovery |
+| --- | --- | --- |
+| Operation prepared, not dispatched | No append before crash; one after recovery | Executes the admitted operation once |
+| VM executed; controller has no result | One append before and after recovery | Queries the VM receipt; never redispatches |
+| Result stored; not returned to Codex | One append before and after recovery | Reuses the stored result |
+
+Each case retained the original product run and native root/child IDs. The original
+input was not resubmitted. The worker used the normal lease-expiry/recovery queue;
+no manual database unlock made the test pass. Authenticated screenshots before,
+after and after refresh were visually reviewed: the root completed its recovery
+summary while the interrupted child's row remained **Interrupted**. API/web service
+restart, fresh browser login and another refresh retained those identities and
+states without another model turn or VM command.
+
+These are bounded command-operation results, not a general exactly-once guarantee
+for arbitrary GUI actions or external transactions. VM/host power loss, native
+mobile/Electron sessions, voice, macOS and Windows remain outside acceptance.
 
 ## Implemented in source
 
@@ -24,7 +41,7 @@ crash, real native mobile/Electron app sessions, voice, macOS or Windows compute
 | Product entry points | API and independent Graphile worker construct `CodexAgentRuntime` | Real model and temporary VM chain accepted |
 | Codex ownership | Native root/child threads, inherited scoped MCP tools, persistent bindings/checkpoints | Runtime owns history and scheduling; no Pi fallback loop |
 | Native session tree | Native IDs are projected into events and durable subagent message blocks; web/Electron and Expo render them | Web identity, viewport screenshots and refresh visually accepted; native app runs untested |
-| Recovery | Bindings and Codex state persist across processes | Same root verified after a worker restart between completed turns; ambiguous admitted turns are not automatically replayed |
+| Recovery | Durable controller operation journal, root-owned VM receipts, fenced queue leases and persistent native bindings | Completed-turn restart and three mid-turn worker-crash windows accepted; unresolved outcomes block new effects |
 | Incus Ubuntu | Attach-only explicit instance bindings; commands, files, screenshots and GUI actions | Real temporary VM product chain and independent nonce readback accepted; no automatic VM creation |
 | Local test environment | Isolated PostgreSQL, HTTP signup/session/RPC and authenticated web rendering verified | No model or VM evidence follows from this preflight |
 | macOS / Windows computers | Architecture separates runtime from computer backends | Drivers, host management and mixed-computer acceptance remain planned |
@@ -35,6 +52,14 @@ support. Native tree rows display runtime identity; they do not turn a Codex chi
 ID into a Rakazo bot-navigation or authorization capability. Do not assume upstream
 published clients, Docker images or existing provider adapters have been accepted
 with the new runtime.
+
+Recovery reconciles operations already admitted before the crash and then produces
+a report with new mutations disabled. It does not automatically execute remaining
+steps of a larger unfinished task. Unknown or unavailable receipts require review;
+there is no operator-resolution UI yet. The guest execution user must not have
+root access to the durable receipt directory. Acceptance verified that boundary
+on its disposable VM; production provisioning must maintain it too. Plain-language
+tool-selection reliability and multi-child concurrency need separate acceptance.
 
 ## Configuration
 
@@ -168,6 +193,6 @@ acceptance guide for the archive contents and operator-controlled retry command.
 
 Keep receipts outside the checkout. The chain receipt explicitly records whether
 its disposable VM remains; obtain a separate independent inventory readback for
-cleanup. Real approval/interruption recovery, mid-turn crash reconciliation,
+cleanup. Real approval recovery, arbitrary GUI transaction reconciliation,
 multi-child/multi-computer concurrency, mixed operating systems and live voice are
 separate later gates. Publish only verified, scoped results.

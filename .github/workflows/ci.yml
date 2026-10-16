@@ -19,6 +19,8 @@ jobs:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
+      - name: Validate publishing gates offline
+        run: ruby .github/workflows/publishing-gates.test.rb
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -120,7 +122,10 @@ jobs:
 
   publish-mobile-update:
     name: Publish compatible mobile update
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Keep upstream delivery unchanged; forks must explicitly opt in to production OTA.
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      (github.repository == 'elie222/rakazo' || vars.MOBILE_OTA_PUBLISH_ENABLED == 'true')
     needs: [lint, check, build, test, test-integration, test-e2e]
     runs-on: ubuntu-latest
     timeout-minutes: 20
