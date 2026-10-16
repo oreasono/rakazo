@@ -238,7 +238,7 @@ export function appendTask(nonce: string, guestPath: string, boundary: CrashBoun
   const command = `printf '%s\\n' '${nonce}' >> '${guestPath}'; sleep ${boundary === "tool_dispatched" ? 90 : 1}; cat '${guestPath}'`;
   return {
     command,
-    prompt: `Delegate exactly one native Codex child using spawn_agent with fork_context:false, then wait for it. Give the child an execution-only task: it must not delegate or spawn another child. It must invoke the inherited Rakazo shell tool once on the assigned remote Incus computer, with this exact command: ${command}\nDo not use the controller shell, create bots, truncate the file, add deduplication guards, or repeat this command. Wait for the child and report its verified result. If interrupted, use verified recovery results and summarize; do not repeat any mutation.`,
+    prompt: `Delegate exactly one native Codex child using spawn_agent with fork_context:false, then wait for it. Give the child an execution-only task: it must not delegate or spawn another child. It must invoke the inherited mcp__rakazo.shell tool (namespace mcp__rakazo, function shell) directly once on the assigned remote Incus computer. Pass this exact command as its command argument: ${command}\nThe child should call that tool directly; goal queries and MCP resource listings do not execute commands. Do not use the controller shell, create bots, truncate the file, add deduplication guards, or repeat this command. Wait for the child and report its verified result. If interrupted, use verified recovery results and summarize; do not repeat any mutation.`,
   };
 }
 
