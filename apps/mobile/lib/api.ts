@@ -32,6 +32,7 @@ import {
   mergeThreadHistory,
   nativeSubagentMetadata,
   prependThreadHistoryPage,
+  preserveNativeSessionMessages,
   preserveNativeSubagentRevisions,
   progressMessageId,
   readBoundedJsonResponse,
@@ -1079,7 +1080,12 @@ export function mergeMobileSnapshot(
     prev.cursor > next.cursor
   )
     return prev;
-  return mergeThreadHistory(prev, next, preserveLoadedHistory);
+  const merged = mergeThreadHistory(prev, next, preserveLoadedHistory);
+  if (!prev || prev.threadId !== next.threadId) return merged;
+  return {
+    ...merged,
+    messages: preserveNativeSessionMessages([...prev.messages, ...next.messages], merged.messages),
+  };
 }
 
 export function prependMobileMessagePage(

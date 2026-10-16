@@ -16,6 +16,7 @@ import {
   mergeThreadHistory,
   nativeSubagentMetadata,
   prependThreadHistoryPage,
+  preserveNativeSessionMessages,
   preserveNativeSubagentRevisions,
   progressMessageId,
   reduceLiveMessageBlocks,
@@ -147,7 +148,12 @@ export function mergeThreadSnapshot(
   // A threads.get started before SSE caught up must not wipe newer live state
   // (e.g. ask cards applied after send's post-refresh request was already in flight).
   if (prev && prev.threadId === next.threadId && prev.cursor > next.cursor) return prev;
-  return mergeThreadHistory(prev, next, preserveLoadedHistory);
+  const merged = mergeThreadHistory(prev, next, preserveLoadedHistory);
+  if (!prev || prev.threadId !== next.threadId) return merged;
+  return {
+    ...merged,
+    messages: preserveNativeSessionMessages([...prev.messages, ...next.messages], merged.messages),
+  };
 }
 
 /**

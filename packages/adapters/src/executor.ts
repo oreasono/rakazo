@@ -306,6 +306,7 @@ import { actorMayUsePrivateEndpoint } from "./private-endpoint.js";
 import type { RemoteTransportDependencies } from "./remote-mcp.js";
 import { assertSafeRemoteUrl } from "./remote-mcp.js";
 import { loadReplyContext, messageToAgentHistoryText } from "./reply-context.js";
+import { runRecoveryClaimFence } from "./run-recovery.js";
 import {
   commitConsumedRunSecret,
   normalizeSecretAskPurpose,
@@ -2724,6 +2725,26 @@ function toolResultError(result: unknown): unknown {
   return text || "tool reported an error result";
 }
 
+/** One execution's Activity writes must settle in order, even when output is streamed. */
+export function orderedComputerCommandPublisher(
+  append: (payload: ComputerCommand) => Promise<unknown>,
+  onError: (error: unknown) => void,
+): (payload: ComputerCommand) => Promise<void> {
+  let completed = false;
+  let pending = Promise.resolve();
+  return (payload) => {
+    if (completed && payload.status === "running") return pending;
+    if (payload.status === "done") completed = true;
+    pending = pending
+      .then(async () => {
+        await append(payload);
+      })
+      // Activity is a view; its write failure must not fail or repeat the operation.
+      .catch(onError);
+    return pending;
+  };
+}
+
 export function toolCompletionFromResult(
   base: Pick<AgentToolCompletion, "name" | "executionId" | "durationMs">,
   result: unknown,
@@ -3245,7 +3266,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
       }
     },
 
-    async continueRun(runId: string, workerId: string) {
+    async continueRun(runId: string, workerId: string, recoveryFence?: number) {
       const run = await deps.prisma.run.findUnique({ where: { id: runId } });
       if (!run) return;
       if (isTerminal(run.status as RunStatus)) return;
@@ -3258,6 +3279,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
         where: {
           id: runId,
           ...continueRunClaimFence(run),
+          AND: [runRecoveryClaimFence(recoveryFence, now)],
           OR: [
             { status: { in: ["queued", "waiting_input", "waiting_takeover"] } },
             {
@@ -3744,22 +3766,25 @@ export function createRunExecutor(deps: ExecutorDeps) {
         );
         let currentTurnFiles: Awaited<ReturnType<typeof materializeCurrentTurnFiles>>;
         try {
-          currentTurnFiles = deps.artifacts
-            ? await materializeCurrentTurnFiles(
-                {
-                  prisma: deps.prisma,
-                  artifacts: deps.artifacts,
-                  sandbox: deps.sandbox,
-                },
-                turnBlocks,
-                {
-                  context,
-                  computer,
-                  computerMode,
-                  markWorkspaceDirty: workspaceCheckpoint.markDirty,
-                },
-              )
-            : [];
+          // A resumed native run already owns its workspace. Re-materializing an
+          // attachment here can overwrite edits before the runtime recovery guard runs.
+          currentTurnFiles =
+            deps.artifacts && !(codexOwned && run.leaseFence > 0)
+              ? await materializeCurrentTurnFiles(
+                  {
+                    prisma: deps.prisma,
+                    artifacts: deps.artifacts,
+                    sandbox: deps.sandbox,
+                  },
+                  turnBlocks,
+                  {
+                    context,
+                    computer,
+                    computerMode,
+                    markWorkspaceDirty: workspaceCheckpoint.markDirty,
+                  },
+                )
+              : [];
         } catch (error) {
           await workspaceCheckpoint.flush().catch(() => undefined);
           throw error;
@@ -4645,18 +4670,18 @@ export function createRunExecutor(deps: ExecutorDeps) {
             runSecrets.push(...additions);
             progressRedactor = createStreamingRedactor(runSecrets);
           };
-          const appendComputerCommand = (payload: ComputerCommand) =>
-            deps.events
-              .append({
+          const appendComputerCommand = orderedComputerCommandPublisher(
+            (payload) =>
+              deps.events.append({
                 spaceId: run.spaceId,
                 threadId: thread.id,
                 botId: bot.id,
                 runId,
                 type: "computer.command",
                 payload,
-              })
-              // The Activity feed is a view; losing an entry must not fail the tool.
-              .catch((error: unknown) => getLogger().error("computer command event", error));
+              }),
+            (error) => getLogger().error("computer command event", error),
+          );
           /** Record a finished file/app action for the terminal's Activity view. */
           const recordComputerAction = (
             kind: Exclude<ComputerCommand["kind"], "shell">,
@@ -5002,6 +5027,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
                 deps.sandbox.execute(
                   computer,
                   {
+                    ...(codexOwned ? { operationId: executionId } : {}),
                     argv: [
                       "bash",
                       "-c",
@@ -6605,6 +6631,59 @@ export function createRunExecutor(deps: ExecutorDeps) {
               allowSilentEmpty: allowSilentEmptyRun,
               emptyResponseText,
               executeTool: scripted ? undefined : applyTool,
+              reconcileTool: codexOwned
+                ? async (name, _args, executionId) => {
+                    context.signal.throwIfAborted();
+                    if (name !== "shell" || !deps.sandbox.reconcileExecution)
+                      return { status: "unknown" as const };
+                    const receipt = await deps.sandbox.reconcileExecution(
+                      computer,
+                      executionId,
+                      context,
+                    );
+                    if (receipt.status !== "completed") return receipt;
+                    const result = {
+                      ...redactShellStreams(receipt.result, runSecrets, { withholdPartial: false }),
+                      code: receipt.result.code,
+                    };
+                    // Repair the existing Activity row from its already-redacted identity.
+                    // Never reconstruct command text from an old raw credential-bearing argument.
+                    const commandEvent = await deps.prisma.event.findFirst({
+                      where: {
+                        runId,
+                        type: "computer.command",
+                        payload: { path: ["executionId"], equals: executionId },
+                      },
+                      orderBy: { seq: "desc" },
+                      select: { payload: true },
+                    });
+                    if (
+                      commandEvent?.payload &&
+                      typeof commandEvent.payload === "object" &&
+                      !Array.isArray(commandEvent.payload)
+                    ) {
+                      await deps.events.append({
+                        spaceId: run.spaceId,
+                        threadId: thread.id,
+                        botId: bot.id,
+                        runId,
+                        type: "computer.command",
+                        payload: {
+                          ...commandEvent.payload,
+                          status: "done",
+                          exitCode: result.code,
+                          output: `${result.stdout}${result.stderr}`.slice(
+                            -COMPUTER_COMMAND_OUTPUT_MAX_CHARS,
+                          ),
+                        },
+                      });
+                    }
+                    return {
+                      status: "completed" as const,
+                      result,
+                    };
+                  }
+                : undefined,
               resolveModel: scripted
                 ? undefined
                 : (provider, modelId) =>
@@ -7490,12 +7569,14 @@ async function renewRunLease(
   workerId: string,
   fence: number,
 ): Promise<boolean> {
+  const now = new Date();
   const renewed = await deps.prisma.run.updateMany({
     where: {
       id: runId,
       status: "running",
       leaseOwner: workerId,
       leaseFence: fence,
+      leaseExpiresAt: { gt: now },
     },
     data: { leaseExpiresAt: new Date(Date.now() + 5 * 60_000) },
   });

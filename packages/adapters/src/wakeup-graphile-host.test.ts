@@ -3,6 +3,7 @@ import {
   HISTORY_COMPACT_MAX_ATTEMPTS,
   historyCompactJob,
   messagingDeliverJob,
+  runRecoveryJob,
 } from "@rakazo/adapter-kit";
 import { createLogger, createTestSink, installLogger, wrapJobPayload } from "@rakazo/logging";
 import type { Runner } from "graphile-worker";
@@ -110,10 +111,30 @@ describe("GraphileJobPublisher.enqueue", () => {
 
   // graphile-worker 0.17.3 add_job: unsafe_dedupe on conflict bumps revision only.
   // replace sets attempts = 0 and run_at = excluded.run_at.
-  function graphileJobs(jobs: Map<string, { attempts: number; maxAttempts: number; runAt: Date }>) {
+  type StoredJob = { attempts: number; maxAttempts: number; runAt: Date; lockedAt?: Date };
+  function graphileJobs(jobs: Map<string, StoredJob>) {
     const query = vi.fn(async (_sql: string, params?: readonly unknown[]) => {
-      const job = jobs.get(String(params?.[0]));
-      return { rows: job ? [{ attempts: job.attempts, max_attempts: job.maxAttempts }] : [] };
+      const retiring = _sql.startsWith("with eligible_run as materialized");
+      const key = String(params?.[retiring ? 2 : 0]);
+      const job = jobs.get(key);
+      if (retiring) {
+        if (job?.lockedAt) {
+          job.attempts = job.maxAttempts;
+          jobs.delete(key);
+        }
+        return { rows: [] };
+      }
+      return {
+        rows: job
+          ? [
+              {
+                attempts: job.attempts,
+                max_attempts: job.maxAttempts,
+                locked_at: job.lockedAt ?? null,
+              },
+            ]
+          : [],
+      };
     });
     const addJob = vi.fn(
       async (
@@ -139,9 +160,7 @@ describe("GraphileJobPublisher.enqueue", () => {
     return { query, addJob, withPgClient };
   }
 
-  function publisherOver(
-    jobs: Map<string, { attempts: number; maxAttempts: number; runAt: Date }>,
-  ) {
+  function publisherOver(jobs: Map<string, StoredJob>) {
     const graphile = graphileJobs(jobs);
     vi.mocked(makeWorkerUtils).mockResolvedValue({
       addJob: graphile.addJob,
@@ -164,7 +183,7 @@ describe("GraphileJobPublisher.enqueue", () => {
       keepExisting: true,
     });
     expect(query).toHaveBeenCalledWith(
-      "select attempts, max_attempts from graphile_worker._private_jobs where key = $1",
+      "select attempts, max_attempts, locked_at from graphile_worker._private_jobs where key = $1",
       ["run:run-1"],
     );
     expect(addJob).toHaveBeenCalledWith(
@@ -177,6 +196,89 @@ describe("GraphileJobPublisher.enqueue", () => {
       }),
     );
     expect(jobs.get("run:run-1")).toEqual({ attempts: 2, maxAttempts: 25, runAt });
+    await publisher.close();
+  });
+
+  it("replaces a locked recovery wakeup without unlocking its worker's job", async () => {
+    const recovery = runRecoveryJob("run-crashed", 7);
+    const old = { attempts: 1, maxAttempts: 25, runAt: new Date(), lockedAt: new Date() };
+    const original = { ...old };
+    const jobs = new Map([
+      [recovery.replaceKey!, old],
+      ["run:run-crashed", original],
+    ]);
+    const { publisher, addJob, query } = publisherOver(jobs);
+
+    await publisher.enqueue(recovery);
+
+    expect(addJob).toHaveBeenCalledWith("run.continue", expect.anything(), {
+      runAt: undefined,
+      jobKey: recovery.replaceKey,
+      maxAttempts: undefined,
+    });
+    expect(jobs.get(recovery.replaceKey!)?.lockedAt).toBeUndefined();
+    expect(jobs.has("run:run-crashed")).toBe(false);
+    expect(original.attempts).toBe(original.maxAttempts);
+    expect(original.lockedAt).toBe(old.lockedAt);
+    expect(query).toHaveBeenCalledWith(
+      expect.stringContaining('where id = $1 and "leaseFence" = $2'),
+      ["run-crashed", 7, "run:run-crashed"],
+    );
+    expect(query.mock.calls.every(([sql]) => !sql.includes("locked_at = null"))).toBe(true);
+    await publisher.close();
+  });
+
+  it("preserves an unlocked original continuation when publishing a delayed recovery wakeup", async () => {
+    const original = { attempts: 2, maxAttempts: 25, runAt: new Date(Date.now() + 60_000) };
+    const jobs = new Map([["run:run-crashed", original]]);
+    const { publisher } = publisherOver(jobs);
+
+    await publisher.enqueue(runRecoveryJob("run-crashed", 7));
+
+    expect(jobs.get("run:run-crashed")).toBe(original);
+    expect(original.attempts).toBe(2);
+    await publisher.close();
+  });
+
+  it("preserves recovery retry backoff when its job is unlocked", async () => {
+    const recovery = runRecoveryJob("run-crashed", 7);
+    const old = { attempts: 2, maxAttempts: 25, runAt: new Date(Date.now() + 60_000) };
+    const jobs = new Map([[recovery.replaceKey!, old]]);
+    const { publisher, addJob } = publisherOver(jobs);
+
+    await publisher.enqueue(recovery);
+
+    expect(addJob).toHaveBeenCalledWith(
+      "run.continue",
+      expect.anything(),
+      expect.objectContaining({
+        jobKeyMode: "unsafe_dedupe",
+      }),
+    );
+    expect(jobs.get(recovery.replaceKey!)).toBe(old);
+    await publisher.close();
+  });
+
+  it("does not replace an ordinary locked run job based on its age", async () => {
+    const old = { attempts: 1, maxAttempts: 25, runAt: new Date(0), lockedAt: new Date(0) };
+    const jobs = new Map([["run:run-active", old]]);
+    const { publisher, addJob } = publisherOver(jobs);
+
+    await publisher.enqueue({
+      name: "run.continue",
+      payload: { runId: "run-active" },
+      replaceKey: "run:run-active",
+      keepExisting: true,
+    });
+
+    expect(addJob).toHaveBeenCalledWith(
+      "run.continue",
+      expect.anything(),
+      expect.objectContaining({
+        jobKeyMode: "unsafe_dedupe",
+      }),
+    );
+    expect(jobs.get("run:run-active")).toBe(old);
     await publisher.close();
   });
 

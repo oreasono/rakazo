@@ -68,7 +68,7 @@ function liveEnv(s) {
   // Connection, isolation, auth and queue ownership are set only by this launcher.
   for (const key of Object.keys(extra)) {
     if (
-      /^(DATABASE_URL|REALTIME_DATABASE_URL|DATA_DIR|CODEX_HOME|HOME|NODE_OPTIONS|NODE_ENV|WAKEUP_DRIVER|API_|WEB_|BETTER_AUTH_|ENCRYPTION_KEY|SCREEN_PROXY_SECRET|AGENT_RUNTIME|SANDBOX_PROVIDER)/.test(
+      /^(DATABASE_URL|REALTIME_DATABASE_URL|DATA_DIR|CODEX_HOME|HOME|NODE_OPTIONS|NODE_ENV|WAKEUP_DRIVER|API_|WEB_|BETTER_AUTH_|ENCRYPTION_KEY|SCREEN_PROXY_SECRET|AGENT_RUNTIME|SANDBOX_PROVIDER|RAKAZO_CODEX_CRASH_GATE)/.test(
         key,
       )
     )
@@ -242,17 +242,22 @@ async function startService(s, name) {
   if (!["api", "worker", "web"].includes(name)) throw new Error("Unknown service");
   if (ownedProcess(s, s.services[name])) throw new Error(`${name} is already running`);
   const fd = openSync(path.join(s.directory, `${name}.log`), "a", 0o600);
-  const proc = spawn(s.node, [script, "service", `--state=${s.directory}`, `--name=${name}`], {
-    cwd: repo,
-    detached: true,
-    env: bareEnv(),
-    stdio: ["ignore", fd, fd],
-  });
+  const generation = randomUUID();
+  const proc = spawn(
+    s.node,
+    [script, "service", `--state=${s.directory}`, `--name=${name}`, `--generation=${generation}`],
+    {
+      cwd: repo,
+      detached: true,
+      env: bareEnv(),
+      stdio: ["ignore", fd, fd],
+    },
+  );
   closeSync(fd);
   proc.unref();
   s.services[name] = {
     pid: proc.pid,
-    generation: randomUUID(),
+    generation,
     startedAt: new Date().toISOString(),
   };
   persist(s);
@@ -264,10 +269,11 @@ async function startService(s, name) {
     if (!ownedProcess(s, s.services[name]))
       throw new Error(`${name} exited; inspect its private log`);
     if (
-      !url ||
-      (await fetch(url, { signal: AbortSignal.timeout(2000) })
-        .then((r) => r.ok)
-        .catch(() => false))
+      (!url && ownedWorker(s)) ||
+      (url &&
+        (await fetch(url, { signal: AbortSignal.timeout(2000) })
+          .then((r) => r.ok)
+          .catch(() => false)))
     )
       return;
   }
@@ -277,6 +283,11 @@ async function service() {
   const s = state(),
     name = arg("name"),
     env = liveEnv(s);
+  if (name === "worker" && s.mode === "live") {
+    const gate = path.join(s.directory, "crash-gate.json");
+    if (!existsSync(gate)) save(gate, { phase: "disabled" });
+    env.RAKAZO_CODEX_CRASH_GATE = gate;
+  }
   const entry =
     name === "web"
       ? path.join(repo, "apps/web/node_modules/vite/bin/vite.js")
@@ -290,17 +301,122 @@ async function service() {
     env,
     stdio: "inherit",
   });
+  if (name === "worker" && child.pid) {
+    save(path.join(s.directory, "worker-process.json"), {
+      pid: child.pid,
+      wrapperPid: process.pid,
+      generation: arg("generation"),
+      started: processStart(child.pid),
+      entry,
+    });
+  }
   process.on("SIGTERM", () => child.kill("SIGTERM"));
   process.on("SIGINT", () => child.kill("SIGINT"));
   child.once("error", () => process.exit(1));
   child.once("exit", (code) => process.exit(code ?? 1));
+}
+
+function processStart(pid) {
+  return execFileSync("ps", ["-p", String(pid), "-o", "lstart="], { encoding: "utf8" }).trim();
+}
+function ownedWorker(s) {
+  const file = path.join(s.directory, "worker-process.json");
+  if (!existsSync(file) || !ownedProcess(s, s.services.worker)) return undefined;
+  const info = json(file);
+  if (
+    info.generation !== s.services.worker.generation ||
+    info.wrapperPid !== s.services.worker.pid ||
+    !Number.isSafeInteger(info.pid) ||
+    info.pid <= 1
+  )
+    return undefined;
+  try {
+    const parent = execFileSync("ps", ["-p", String(info.pid), "-o", "ppid="], {
+      encoding: "utf8",
+    }).trim();
+    const command = execFileSync("ps", ["-p", String(info.pid), "-o", "command="], {
+      encoding: "utf8",
+    });
+    if (
+      Number(parent) !== info.wrapperPid ||
+      processStart(info.pid) !== info.started ||
+      !command.includes(path.join(repo, "apps/worker/src/index.ts"))
+    )
+      return undefined;
+    return info;
+  } catch {
+    return undefined;
+  }
+}
+async function crashWorker(s) {
+  if (s.mode !== "live" || !args.includes("--allow-live"))
+    throw new Error("SIGKILL requires live mode and --allow-live");
+  const hit = json(path.join(s.directory, "crash-hit.json"));
+  const control = json(path.join(s.directory, "crash-control.json"));
+  const info = ownedWorker(s);
+  if (
+    !info ||
+    !arg("fixture-id") ||
+    hit.fixtureId !== arg("fixture-id") ||
+    control.fixtureId !== hit.fixtureId ||
+    hit.workerPid !== info.pid ||
+    hit.boundary !== control.boundary ||
+    !hit.runId ||
+    !hit.executionId
+  )
+    throw new Error("Refusing SIGKILL without matching fixture and owned actual worker PID");
+  const receipt = path.join(s.directory, "crash-kill.json");
+  if (existsSync(receipt))
+    throw new Error("This fixture already attempted SIGKILL; inspect it instead of retrying");
+  save(receipt, {
+    fixtureId: hit.fixtureId,
+    before: info,
+    signal: "SIGKILL",
+    requestedAt: new Date().toISOString(),
+    observedExit: false,
+  });
+  process.kill(info.pid, "SIGKILL");
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    if (!ownedWorker(s) && !ownedProcess(s, s.services.worker)) {
+      save(receipt, { ...json(receipt), observedExit: true, exitedAt: new Date().toISOString() });
+      return;
+    }
+    await sleep(50);
+  }
+  throw new Error("Killed worker/wrapper exit not confirmed; no restart attempted");
+}
+async function restartCrashedWorker(s) {
+  if (s.mode !== "live" || !args.includes("--allow-live"))
+    throw new Error("Crash restart requires live mode and --allow-live");
+  const kill = json(path.join(s.directory, "crash-kill.json"));
+  if (
+    kill.fixtureId !== arg("fixture-id") ||
+    !kill.observedExit ||
+    kill.signal !== "SIGKILL" ||
+    ownedProcess(s, s.services.worker) ||
+    existsSync(path.join(s.directory, "crash-restart.json"))
+  )
+    throw new Error("No matching confirmed crash, or restart already attempted");
+  // Disable only the test latch. Never change DB leases, jobs, checkpoints or native state.
+  save(path.join(s.directory, "crash-gate.json"), { phase: "disabled" });
+  await startService(s, "worker");
+  const after = ownedWorker(s);
+  if (!after || after.pid === kill.before.pid)
+    throw new Error("Actual worker replacement not verified");
+  save(path.join(s.directory, "crash-restart.json"), {
+    fixtureId: kill.fixtureId,
+    before: kill.before,
+    after,
+    restartedAt: new Date().toISOString(),
+  });
 }
 async function main() {
   if (command === "prepare") return prepare();
   if (command === "service") return service();
   if (command === "help") {
     console.log(
-      "prepare [--pg-bin=<bin>] | migrate | start [--offline | --allow-live --config=<private.json>] [--services=api,web] | seed | connect-model --allow-live | run --allow-live [--new-attempt] | capture-tree --allow-live | restart-worker | status | stop; all but prepare require --state=<private dir>. See accept-codex-incus.md.",
+      "prepare [--pg-bin=<bin>] | migrate | start [--offline | --allow-live --config=<private.json>] [--services=api,web] | seed | connect-model --allow-live | run --allow-live [--new-attempt] | crash-run --allow-live --boundary=<tool_prepared|tool_dispatched|tool_result_stored> | capture-tree --allow-live | restart-worker | status | stop; all but prepare require --state=<private dir>. See accept-codex-incus.md.",
     );
     return;
   }
@@ -308,6 +424,8 @@ async function main() {
   s.node = process.execPath;
   s.env.PATH = `${path.dirname(process.execPath)}${path.delimiter}${s.env.PATH}`;
   persist(s);
+  if (command === "crash-worker") return crashWorker(s);
+  if (command === "crash-restart-worker") return restartCrashedWorker(s);
   if (command === "migrate") {
     privateLog(s, "generate", "pnpm", ["--filter", "@rakazo/db", "generate"]);
     privateLog(s, "migrate", "pnpm", [
@@ -357,7 +475,7 @@ async function main() {
     console.log("Acceptance worker restarted; private restart receipt saved.");
     return;
   }
-  if (["seed", "connect-model", "run", "capture-tree"].includes(command)) {
+  if (["seed", "connect-model", "run", "capture-tree", "crash-run"].includes(command)) {
     if (command !== "seed" && (s.mode !== "live" || !args.includes("--allow-live")))
       throw new Error("Real acceptance needs live services and --allow-live");
     privateLog(
@@ -367,10 +485,16 @@ async function main() {
       [
         "--import",
         path.join(repo, "node_modules/tsx/dist/loader.mjs"),
-        path.join(repo, "packages/testkit/src/codex-incus-acceptance.ts"),
+        path.join(
+          repo,
+          command === "crash-run"
+            ? "packages/testkit/src/codex-crash-acceptance.ts"
+            : "packages/testkit/src/codex-incus-acceptance.ts",
+        ),
         command,
         `--state=${s.directory}`,
         ...(command === "run" && args.includes("--new-attempt") ? ["--new-attempt"] : []),
+        ...(command === "crash-run" ? ["--allow-live", `--boundary=${arg("boundary") ?? ""}`] : []),
       ],
       { ...s.env, RAKAZO_ACCEPTANCE_STATE: s.directory },
       1_800_000,
@@ -387,7 +511,11 @@ async function main() {
         services: Object.fromEntries(
           Object.entries(s.services).map(([name, info]) => [
             name,
-            { ...info, alive: ownedProcess(s, info) },
+            {
+              ...info,
+              alive: ownedProcess(s, info),
+              ...(name === "worker" ? { worker: ownedWorker(s) ?? null } : {}),
+            },
           ]),
         ),
       }),

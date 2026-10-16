@@ -42,6 +42,7 @@ async function bridge(
     executeTool?: AgentRunRequest["executeTool"];
     tools?: ConnectorTool[];
     onToolCompleted?: AgentRunRequest["onToolCompleted"];
+    recoveryOnly?: boolean;
   } = {},
 ) {
   const tools = input.tools ?? [tool()];
@@ -68,10 +69,27 @@ async function bridge(
     signal: controller.signal,
     emit,
     pause,
+    recoveryOnly: input.recoveryOnly,
   });
   cleanup.push(() => transport.close());
   return { ...transport, executeTool, onToolCompleted, emit, pause, controller };
 }
+
+it("rejects new tool identities and altered arguments during recovery even with a stale grant", async () => {
+  const b = await bridge({ tools: [tool("shell")], recoveryOnly: true });
+  for (const [id, command] of [
+    ["new-call", "append"],
+    ["another-call", "different append"],
+  ]) {
+    const result = await post(b.socket, {
+      method: "tools/call",
+      executionId: id,
+      params: { name: "shell", arguments: { command } },
+    });
+    expect(result.status).toBe(403);
+  }
+  expect(b.executeTool).not.toHaveBeenCalled();
+});
 
 function post(
   socket: string,

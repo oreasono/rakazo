@@ -4,7 +4,9 @@ import { describe, expect, it } from "vitest";
 import { projectMessages, subagentBlockFromPayload } from "./events.js";
 import {
   buildNativeSessionTrees,
+  nativeSessionStatus,
   nativeSubagentMetadata,
+  preserveNativeSessionMessages,
   upsertNativeSubagentMessage,
   withoutNativeSessionBlocks,
 } from "./native-session-tree.js";
@@ -73,11 +75,14 @@ describe("native session tree", () => {
     expect(buildNativeSessionTrees([mixed])[0]?.nodes).toHaveLength(2);
   });
 
-  it("preserves native metadata through the public message schema and live projection", () => {
-    const value = { ...block("root", null), nativeStatus: "idle", nativeRevision: 4 };
-    expect(MessageBlockSchema.parse(value)).toEqual(value);
-    expect(subagentBlockFromPayload(value)).toMatchObject(value);
-  });
+  it.each(["idle", "interrupted", "recovering", "recovery_required"])(
+    "preserves %s metadata through the public message schema and live projection",
+    (nativeStatus) => {
+      const value = { ...block("root", null), nativeStatus, nativeRevision: 4 };
+      expect(MessageBlockSchema.parse(value)).toEqual(value);
+      expect(subagentBlockFromPayload(value)).toMatchObject(value);
+    },
+  );
 
   it("shows a root-only thread with observed state", () => {
     expect(
@@ -286,5 +291,143 @@ describe("durable event projection revision compatibility", () => {
     expect(
       buildNativeSessionTrees(JSON.parse(JSON.stringify(messages)))[0]?.nodes[1],
     ).toMatchObject({ nativeRevision: 4, status: "running" });
+  });
+
+  it("restores parent and child through interruption, recovery and completion with no old progress", () => {
+    const base = {
+      threadId: "product-thread",
+      runId: "run",
+      createdAt: "2026-01-01T00:00:00Z",
+    };
+    const events: Parameters<typeof projectMessages>[0] = [
+      { ...base, id: "progress", seq: 1, type: "thread.progress", payload: { text: "Old draft" } },
+    ];
+    const stages = [
+      { nativeStatus: "interrupted", status: "failed", revision: 2 },
+      { nativeStatus: "recovering", status: "running", revision: 4 },
+      { nativeStatus: "completed", status: "completed", revision: 6 },
+    ] as const;
+    for (const stage of stages) {
+      for (const [index, id] of ["root", "child"].entries()) {
+        const nativeRevision = stage.revision + index;
+        const value = {
+          ...block(id, id === "root" ? null : "root", stage.status),
+          nativeStatus: stage.nativeStatus,
+          nativeRevision,
+        };
+        events.push(
+          {
+            ...base,
+            id: `live-${nativeRevision}`,
+            seq: events.length + 1,
+            type: "thread.subagent",
+            payload: value,
+          },
+          {
+            ...base,
+            id: `stored-${nativeRevision}`,
+            seq: events.length + 2,
+            type: "thread.message.updated",
+            payload: { messageId: `stored-${id}`, blocks: [value] },
+          },
+        );
+      }
+      const restored = JSON.parse(JSON.stringify(projectMessages(events)));
+      expect(restored).toHaveLength(2);
+      expect(buildNativeSessionTrees(restored)[0]?.nodes).toMatchObject([
+        {
+          threadId: "root",
+          parentThreadId: null,
+          status: stage.status,
+          nativeStatus: stage.nativeStatus,
+          nativeRevision: stage.revision,
+        },
+        {
+          threadId: "child",
+          parentThreadId: "root",
+          status: stage.status,
+          nativeStatus: stage.nativeStatus,
+          nativeRevision: stage.revision + 1,
+        },
+      ]);
+      expect(withoutNativeSessionBlocks(restored)).toEqual([]);
+      expect(JSON.stringify(restored)).not.toContain("Old draft");
+    }
+  });
+});
+
+describe("native session presentation", () => {
+  it.each(["running", "failed", "completed"] as const)(
+    "never paints recovery states green even with legacy status %s",
+    (status) => {
+      expect(nativeSessionStatus({ status, nativeStatus: "recovering" })).toEqual({
+        label: "Recovering",
+        tone: "warning",
+      });
+      expect(nativeSessionStatus({ status, nativeStatus: "interrupted" })).toEqual({
+        label: "Interrupted",
+        tone: "destructive",
+      });
+      expect(nativeSessionStatus({ status, nativeStatus: "recovery_required" })).toEqual({
+        label: "Needs review",
+        tone: "destructive",
+      });
+    },
+  );
+
+  it("preserves failure and unknown root semantics without inferring success from native labels", () => {
+    expect(nativeSessionStatus({})).toBeUndefined();
+    expect(nativeSessionStatus({ status: "failed", nativeStatus: "idle" })?.tone).toBe(
+      "destructive",
+    );
+    expect(nativeSessionStatus({ status: "completed", nativeStatus: "idle" })?.tone).toBe(
+      "success",
+    );
+    expect(nativeSessionStatus({ status: "running" })?.label).toBe("running");
+  });
+});
+
+describe("native session refresh", () => {
+  it("preserves missing descendants and newer revisions without old mixed content or progress", () => {
+    const root = { ...block("root", null), nativeStatus: "recovering", nativeRevision: 10 };
+    const child = { ...block("child"), nativeStatus: "recovering", nativeRevision: 11 };
+    const previous = [
+      message(root, 1),
+      { ...message(child, 2), blocks: [child, { kind: "text" as const, text: "Old answer" }] },
+      message({ kind: "progress", text: "Old draft" }, 900, "progress:run"),
+    ];
+    const recent = [
+      message({ ...root, status: "failed", nativeStatus: "interrupted", nativeRevision: 8 }, 1),
+    ];
+    const refreshed = preserveNativeSessionMessages(previous, recent);
+    expect(buildNativeSessionTrees(refreshed)).toEqual(buildNativeSessionTrees(previous));
+    expect(JSON.stringify(refreshed)).not.toContain("Old answer");
+    expect(JSON.stringify(refreshed)).not.toContain("Old draft");
+    expect(withoutNativeSessionBlocks(refreshed)).toEqual([]);
+
+    const restored = JSON.parse(JSON.stringify(refreshed));
+    const completed = preserveNativeSessionMessages(restored, [
+      message({ ...root, status: "completed", nativeStatus: "completed", nativeRevision: 12 }),
+      message(
+        { ...child, status: "failed", nativeStatus: "recovery_required", nativeRevision: 13 },
+        2,
+      ),
+    ]);
+    const nodes = buildNativeSessionTrees(completed)[0]?.nodes ?? [];
+    expect(nodes.map((node) => node.nativeRevision)).toEqual([12, 13]);
+    expect(nodes.map(nativeSessionStatus)).toEqual([
+      { label: "completed", tone: "success" },
+      { label: "Needs review", tone: "destructive" },
+    ]);
+    expect(buildNativeSessionTrees(preserveNativeSessionMessages(completed, recent))).toEqual(
+      buildNativeSessionTrees(completed),
+    );
+  });
+
+  it("does not revive a cleared tree or import nodes from another root", () => {
+    const previous = [message({ ...block("child"), nativeRevision: 5 })];
+    expect(preserveNativeSessionMessages(previous, [])).toEqual([]);
+    const recent = [message({ ...block("other", null), rootThreadId: "other", nativeRevision: 1 })];
+    expect(preserveNativeSessionMessages(previous, recent)).toEqual(recent);
   });
 });

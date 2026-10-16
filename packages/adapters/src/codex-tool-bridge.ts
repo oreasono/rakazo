@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentRunRequest, AgentRuntimeEvent, ConnectorTool } from "@rakazo/adapter-kit";
 import { isToolPauseResult } from "./approval-effect.js";
+import type { CodexToolJournal } from "./codex-tool-journal.js";
+import { CodexRecoveryRequired } from "./codex-tool-journal.js";
 
 export async function createCodexToolBridge(options: {
   request: AgentRunRequest;
@@ -11,6 +13,10 @@ export async function createCodexToolBridge(options: {
   signal: AbortSignal;
   emit: (event: AgentRuntimeEvent) => void;
   pause: () => void;
+  journal?: CodexToolJournal;
+  /** Automatic crash reconciliation can report results but cannot admit new effects. */
+  recoveryOnly?: boolean;
+  recoveryRequired?: () => void;
 }) {
   const directory = await mkdtemp(join(tmpdir(), "rkc-"));
   const socket = join(directory, "tools.sock");
@@ -47,7 +53,12 @@ export async function createCodexToolBridge(options: {
       }
       const name = body.params?.name;
       const tool = name ? tools.get(name) : undefined;
-      if (body.method !== "tools/call" || !tool || !/^[a-zA-Z0-9-]{1,80}$/.test(body.executionId)) {
+      if (
+        options.recoveryOnly ||
+        body.method !== "tools/call" ||
+        !tool ||
+        !/^[a-zA-Z0-9-]{1,80}$/.test(body.executionId)
+      ) {
         throw new Error("Tool is not granted");
       }
       const args = body.params?.arguments ?? {};
@@ -78,7 +89,9 @@ export async function createCodexToolBridge(options: {
             return { content: [{ type: "text", text: "Waiting for takeover." }] };
           }
           if (!options.request.executeTool) throw new Error("No tool executor");
-          result = await options.request.executeTool(tool.name, args, executionId, tool.route);
+          result = options.journal
+            ? await options.journal.execute(tool, args, executionId)
+            : await options.request.executeTool(tool.name, args, executionId, tool.route);
           if (isToolPauseResult(result)) options.pause();
           if (
             result &&
@@ -92,6 +105,7 @@ export async function createCodexToolBridge(options: {
           return { content: [{ type: "text", text: JSON.stringify(result ?? null) }] };
         } catch (error) {
           failure = error;
+          if (error instanceof CodexRecoveryRequired) options.recoveryRequired?.();
           // Preserve a useful error without returning arbitrary adapter diagnostics.
           return { isError: true, content: [{ type: "text", text: "The requested tool failed." }] };
         } finally {

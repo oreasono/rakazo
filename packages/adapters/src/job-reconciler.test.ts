@@ -42,6 +42,59 @@ function fakePrisma(
 }
 
 describe("createJobReconciler", () => {
+  it("recovers expired executions with one job key per lease fence and the same run id", async () => {
+    const prisma = fakePrisma();
+    const expired = [
+      { id: "run-running", status: "running", leaseFence: 7, updatedAt: new Date() },
+      { id: "run-leased", status: "leased", leaseFence: 2, updatedAt: new Date() },
+    ];
+    vi.mocked(prisma.run.findMany).mockImplementation(
+      (args) =>
+        Promise.resolve(args?.select && "leaseFence" in args.select ? expired : []) as never,
+    );
+    const { jobs, enqueue } = publisher();
+    const reconciler = createJobReconciler({ prisma, jobs });
+
+    await reconciler.reconcileOnce();
+    await reconciler.reconcileOnce();
+
+    expect(enqueue.mock.calls.map(([job]) => job)).toEqual([
+      {
+        name: "run.continue",
+        payload: { runId: "run-running", recoveryFence: 7 },
+        replaceKey: "run:run-running:recovery:7",
+        keepExisting: true,
+      },
+      {
+        name: "run.continue",
+        payload: { runId: "run-leased", recoveryFence: 2 },
+        replaceKey: "run:run-leased:recovery:2",
+        keepExisting: true,
+      },
+      expect.objectContaining({ replaceKey: "run:run-running:recovery:7" }),
+      expect.objectContaining({ replaceKey: "run:run-leased:recovery:2" }),
+    ]);
+    // Expiry comes from the Run lease, never Graphile lock age or run updatedAt.
+    expect(prisma.run.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          AND: [
+            {
+              OR: [
+                { status: "queued" },
+                {
+                  status: { in: ["leased", "running"] },
+                  leaseExpiresAt: { lte: expect.any(Date) },
+                },
+              ],
+            },
+          ],
+        },
+        take: 100,
+      }),
+    );
+  });
+
   it("continues the main scans when an auxiliary reconciler fails", async () => {
     const prisma = fakePrisma();
     const { jobs } = publisher();

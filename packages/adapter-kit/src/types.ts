@@ -89,6 +89,8 @@ export interface ComputerRef {
 
 export interface CommandRequest {
   argv: string[];
+  /** Stable caller-scoped operation identity for providers with durable execution receipts. */
+  operationId?: string;
   cwd?: string;
   env?: Record<string, string>;
   /** Remove these variables after all environment overlays, including inherited values. */
@@ -97,6 +99,11 @@ export interface CommandRequest {
   /** Maximum wall-clock runtime before the command and its descendants are terminated. */
   timeoutMs?: number;
 }
+
+export type ExecutionReconciliation =
+  | { status: "completed"; result: { stdout: string; stderr: string; code: number } }
+  | { status: "pending" }
+  | { status: "unknown" };
 
 export type ProcessEvent =
   | { type: "stdout"; data: string }
@@ -488,6 +495,12 @@ export interface AgentRunRequest {
     route?: ConnectorRoute,
     observer?: AgentToolExecutionObserver,
   ) => Promise<unknown>;
+  /** Read-only lookup of an admitted operation; it must never execute or resend the tool. */
+  reconcileTool?: (
+    name: string,
+    args: Record<string, unknown>,
+    executionId: string,
+  ) => Promise<{ status: "completed"; result: unknown } | { status: "pending" | "unknown" }>;
   /** Called after a tool returns; implementations must not persist raw result contents. */
   onToolCompleted?: (completion: AgentToolCompletion) => Promise<void> | void;
   /** Atomically claim durable user steering at the runtime's next safe turn boundary. */
@@ -634,7 +647,7 @@ export interface VoiceTranscribeRequest {
 }
 
 export interface BackgroundJobPayloads {
-  "run.continue": { runId: string };
+  "run.continue": { runId: string; recoveryFence?: number };
   "routine.wakeup": { routineId: string; scheduledFor: string };
   "computer.sleep": { computerId: string };
   "computer.update": { updateId: string };

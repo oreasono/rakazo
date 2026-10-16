@@ -1,5 +1,9 @@
 # Real Codex / Incus product acceptance
 
+The separate [mid-turn SIGKILL gate](#mid-turn-sigkill-gate) below covers three exact
+operation boundaries. A completed-turn restart receipt from `run` does not establish
+mid-turn crash recovery.
+
 This opt-in harness runs the actual API, a separate Graphile worker, PostgreSQL and the web
 client. It never calls an `AgentRuntime` directly, creates a VM, reuses a shared `.env`, or
 replays a failed live attempt automatically. The provisioning owner allocates **one new,
@@ -183,3 +187,142 @@ The screenshot helper also has an offline, synthetic-page browser test. Set
 `CODEX_INCUS_TEST_CHROMIUM` to an installed Chromium executable if Playwright's browser is
 not installed, then run `packages/testkit/src/codex-incus-browser.test.ts` with Vitest.
 It starts a headless test browser only; it does not access the product or test database.
+
+## Mid-turn SIGKILL gate
+
+`crash-run` uses the same private-state launcher, real API, separate Graphile worker,
+Codex root/native child, and provisioned Incus computer. It calls `threads/send` exactly
+once. It never invokes `AgentRuntime` directly, edits DB rows/leases, resubmits the original
+input, or fabricates recovery events. A passing offline test is not live acceptance.
+
+Use a **fresh private state and freshly seeded bot for each boundary**. The seed may contain
+the cancelled, never-executed intro created by setup, but no prior native history or executed
+turn. Complete the normal migrate, live seed, VM binding and model connection steps first.
+Stop the previous state's services before running another scenario. The provisioning owner
+may explicitly reuse the same newly allocated disposable VM across the three isolated states;
+only one worker may own it at a time. Each scenario uses a new random output path and nonce.
+Preserve every state's evidence. This command has no automatic retry or `--new-attempt` mode.
+
+Start the worker with the updated launcher so it records its **actual child PID**, parent
+wrapper PID, generation and process start time in `worker-process.json`. Older wrapper-only
+state cannot authorize a crash. `status` includes the actual worker identity when verified.
+
+```sh
+node scripts/accept-codex-incus.mjs crash-run --allow-live --boundary=tool_dispatched --state="$STATE"
+# Run these in two separately prepared fresh states, after stopping the prior worker:
+node scripts/accept-codex-incus.mjs crash-run --allow-live --boundary=tool_prepared --state="$STATE"
+node scripts/accept-codex-incus.mjs crash-run --allow-live --boundary=tool_result_stored --state="$STATE"
+```
+
+`readbackCommand` must return the exact guest file bytes. For the initial absent file, it must
+return empty bytes with exit status zero **only for file-not-found**. Connection, permission,
+timeout and other failures must remain nonzero. Do not use `cat ... || true`. The independent
+wrapper must use this scenario's `{computerRef}` and `{path}` placeholders; it never reads a
+nonce or counter from model prose. An external inventory and provisioning receipt are still
+required. Configure `phaseTimeoutMs` if needed; the crash gate defaults to twelve minutes
+for reaching the boundary and another twelve minutes for recovery. It uses normal production
+lease/heartbeat/reconciliation intervals, with no shortened TTL or Graphile unlock SQL.
+
+| Boundary | Controller evidence before SIGKILL | Independent VM bytes before SIGKILL |
+| --- | --- | --- |
+| `tool_prepared` | Durable journal `prepared`; server latch reached before dispatch | Empty |
+| `tool_dispatched` | Durable journal `dispatched`; the non-idempotent shell command is still sleeping | Exactly one nonce plus LF |
+| `tool_result_stored` | Durable journal `completed`; server latch reached before bridge HTTP reply; stored result digest | Exactly one nonce plus LF |
+
+The command deliberately uses unguarded `printf ... >> file`, then sleeps (90 seconds for
+the dispatched case) and reads the file. There is no `test`, lock or deduplication guard in
+the guest command. Executing it twice visibly appends twice. Every recovered scenario must
+end with exactly one nonce line, including another independent readback after browser refresh.
+
+### Trusted injection contract
+
+Only the live **worker** receives `RAKAZO_CODEX_CRASH_GATE`, pointing at private
+`crash-gate.json`; `NODE_ENV=test` is also required. The launcher reserves this environment
+variable so private config cannot redirect the latch. The harness writes the following
+control atomically. These are placeholders, never tracked live paths or credentials:
+
+```json
+{
+  "phase": "tool_prepared",
+  "tool": "shell",
+  "argumentIncludes": "CRASH_<random nonce>",
+  "reachedFile": "<private state>/crash-gate/reached.json",
+  "releaseFile": "<private state>/crash-gate/release"
+}
+```
+
+The runtime hook runs after the selected durable journal transition, atomically writes
+mode-0600 `{phase,pid,executionId,at}`, and blocks for at most 120 seconds, until release or
+cancellation. For `tool_result_stored` it must block before the HTTP response reaches Codex.
+An already existing reached file makes the latch one-shot. The dispatched case uses
+`{ "phase": "disabled" }` and external readback instead of blocking dispatch. The model cannot
+choose injection paths or authorize SIGKILL. The harness correlates the reached record with
+the known worker, exact shell command and the current run's real journal at
+`sessionHome/operations/<sha256(runId)>/<sha256(executionId)>.json`.
+
+The harness creates `crash-control.json` and `crash-hit.json` as evidence manifests; these
+are not runtime state. It captures the running tree, verifies the native child's actual
+rollout contains the pending append call with no result yet returned, then re-reads the
+journal and external bytes immediately before killing. The launcher independently checks
+fixture identity, PID, parent, generation, start time and worker entry point before sending
+**SIGKILL to the worker child PID**. It confirms worker/wrapper exit and records the kill,
+disables the test latch, and starts a replacement actual worker. It never treats killing
+only the wrapper as worker-crash proof. The journal is read again after kill to detect a
+missed boundary. `crash-worker` and `crash-restart-worker` are internal guarded commands;
+both require `--allow-live` and the matching `--fixture-id`.
+
+### Recovery and browser proof
+
+The runtime must persist `run.checkpointed` events for the same product run and native root
+with `recovery: "reconciling"` followed by `recovery: "reconciled"`. The latter must include
+`mutationAdmission: "closed"` to attest that the summary continuation has no mutation tools.
+Prepared work executes once; dispatched work queries the provider receipt only; a completed
+result is reused. The summary must not enable new MCP mutations or native child creation,
+even under different arguments or call IDs. Unknown GUI/generic outcomes remain
+`recovery_required`/`needs_review` and cannot pass this automatic shell recovery gate.
+
+After recovery, the product run and native root IDs must be unchanged, the root/run must
+complete, and the original child's identity must remain. Its interrupted reasoning is
+truthfully displayed as legacy `failed` plus native `interrupted`, even when its external
+operation succeeded. Painting that child completed is rejected. Node revisions must not
+regress and at least one must advance. Events, durable messages, owner-bound native session
+state, and fresh `threads/messages` API responses must agree. The journal must still contain
+exactly the one original execution ID, now completed; a previously stored result must retain
+its digest. A replacement product run or native child is rejected.
+
+The same run's latest `computer.command` event for the crashed `executionId`, selected by
+durable `seq`, must have `status: "done"` and numeric `exitCode: 0`. A completed native root
+does not excuse an Activity row left running. The stored-result case may use its already
+durable done event from before the crash; prepared/dispatched recovery must leave the same
+execution's activity completed. Older successful events, another execution/run, missing
+events, null exit codes and nonzero exits cannot satisfy this check.
+
+The existing browser helper is reused unchanged. Real authenticated browser captures show
+root/child IDs and visible status text while the run is stopped at its boundary, after
+recovery, and after an actual page reload. The harness checks rendered status attributes and
+visible labels, requires the tree to fit the viewport, and saves tree and page PNGs with
+hashes. It reads both product state and VM bytes again after refresh. The operator must
+inspect the actual images before visual acceptance; `visualReview: "pending"` remains
+explicit in the automated receipt.
+
+All `crash-*` controls, source snapshots, journals, native call evidence, screenshots,
+kill/restart receipts and `crash-receipt.json` stay inside the private state. The harness
+leaves ambiguous work intact on failure: it does not auto-stop, release a latch, retry,
+provision another VM or edit recovery state. Inspect before deciding the next action.
+These receipts establish only this bounded shell-operation recovery; they do not claim
+universal exactly-once execution of arbitrary GUI or external operations.
+
+Offline regressions (no service, model, DB or VM):
+
+```sh
+pnpm exec vitest run packages/testkit/src/codex-crash-proof.test.ts packages/testkit/src/codex-crash-acceptance.test.ts
+pnpm --filter @rakazo/testkit check
+node --check scripts/accept-codex-incus.mjs
+```
+
+The acceptance test executes the generated append command in local Bash using an owned random
+temporary file: one execution writes exact LF-terminated bytes; two executions are rejected
+by the counter proof. The proof tests reject stale/wrong PIDs and runs, wrong boundaries,
+duplicate writes, absent native revisions, old recovery events, a result already returned to
+the model, incorrect child status, stale or unsuccessful command activity, and unknown
+outcomes presented as success.

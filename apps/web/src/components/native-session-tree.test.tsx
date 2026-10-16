@@ -4,6 +4,38 @@ import { describe, expect, it } from "vitest";
 import { NativeSessionTrees } from "./native-session-tree.js";
 
 describe("native session tree presentation", () => {
+  it.each([
+    ["recovering", "Recovering", "warning"],
+    ["interrupted", "Interrupted", "destructive"],
+    ["recovery_required", "Needs review", "destructive"],
+  ])("renders %s without a success color", (nativeStatus, label, tone) => {
+    const html = renderToStaticMarkup(
+      <NativeSessionTrees
+        trees={[
+          {
+            runtime: "codex",
+            rootThreadId: "root",
+            nodes: [
+              { threadId: "root", depth: 0, status: "failed", nativeStatus },
+              {
+                threadId: "child",
+                parentThreadId: "root",
+                depth: 1,
+                status: "completed",
+                nativeStatus,
+              },
+            ],
+          },
+        ]}
+      />,
+    );
+    expect(html.match(new RegExp(`>${label}</span>`, "g"))).toHaveLength(2);
+    expect(html.match(new RegExp(`text-${tone}`, "g"))).toHaveLength(2);
+    expect(html).toContain('data-native-thread-id="child"');
+    expect(html).toContain(`data-native-status="${nativeStatus}"`);
+    expect(html).not.toContain("text-success");
+  });
+
   it("renders real IDs and hierarchy with read-only node states", () => {
     const trees = buildNativeSessionTrees([
       {

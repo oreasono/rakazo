@@ -1,4 +1,5 @@
 import type { NativeSessionTree } from "@rakazo/core";
+import { nativeSessionStatus } from "@rakazo/core";
 import { useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useMobileTokens } from "../lib/native";
@@ -38,44 +39,42 @@ function SessionTree({ tree }: { tree: NativeSessionTree }) {
         </Text>
       </Pressable>
       {expanded
-        ? tree.nodes.map((node) => (
-            <View
-              key={node.threadId}
-              style={[
-                styles.node,
-                { marginLeft: Math.min(node.depth, 4) * 12, borderColor: tokens.border },
-              ]}
-            >
-              <View style={styles.heading}>
-                <Text numberOfLines={1} style={[styles.name, { color: tokens.foreground }]}>
-                  {node.name || "Codex"}
+        ? tree.nodes.map((node) => {
+            const status = nativeSessionStatus(node);
+            return (
+              <View
+                key={node.threadId}
+                style={[
+                  styles.node,
+                  { marginLeft: Math.min(node.depth, 4) * 12, borderColor: tokens.border },
+                ]}
+              >
+                <View style={styles.heading}>
+                  <Text numberOfLines={1} style={[styles.name, { color: tokens.foreground }]}>
+                    {node.name || "Codex"}
+                  </Text>
+                  {status ? (
+                    <Text
+                      style={{
+                        fontSize: 12,
+                        color: tokens[status.tone],
+                      }}
+                    >
+                      {status.label}
+                    </Text>
+                  ) : null}
+                </View>
+                <Text selectable style={[styles.id, { color: tokens.mutedForeground }]}>
+                  {node.threadId}
                 </Text>
-                {node.status ? (
-                  <Text
-                    style={{
-                      fontSize: 12,
-                      color:
-                        node.status === "failed"
-                          ? tokens.destructive
-                          : node.status === "running"
-                            ? tokens.warning
-                            : tokens.success,
-                    }}
-                  >
-                    {node.nativeStatus || node.status}
+                {node.unresolvedParent || node.depth > 4 ? (
+                  <Text selectable style={[styles.id, { color: tokens.mutedForeground }]}>
+                    ↑ {node.parentThreadId}
                   </Text>
                 ) : null}
               </View>
-              <Text selectable style={[styles.id, { color: tokens.mutedForeground }]}>
-                {node.threadId}
-              </Text>
-              {node.unresolvedParent || node.depth > 4 ? (
-                <Text selectable style={[styles.id, { color: tokens.mutedForeground }]}>
-                  ↑ {node.parentThreadId}
-                </Text>
-              ) : null}
-            </View>
-          ))
+            );
+          })
         : null}
     </View>
   );

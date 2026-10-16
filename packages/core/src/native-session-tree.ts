@@ -69,6 +69,26 @@ export interface NativeSessionTree {
   nodes: NativeSessionNode[];
 }
 
+/** Recovery describes the native session, independently of the legacy task status. */
+export function nativeSessionStatus(
+  node: Pick<NativeSessionNode, "status" | "nativeStatus">,
+): { label: string; tone: "warning" | "destructive" | "success" } | undefined {
+  switch (node.nativeStatus) {
+    case "recovering":
+      return { label: "Recovering", tone: "warning" };
+    case "interrupted":
+      return { label: "Interrupted", tone: "destructive" };
+    case "recovery_required":
+      return { label: "Needs review", tone: "destructive" };
+  }
+  if (!node.status) return undefined;
+  return {
+    label: node.nativeStatus || node.status,
+    tone:
+      node.status === "failed" ? "destructive" : node.status === "running" ? "warning" : "success",
+  };
+}
+
 /** Rebuild solely from persisted messages plus optional live overlays, without client storage.
  * Native revision wins across durable messages and live events: their seq counters differ.
  * Unversioned legacy data uses seq; at an equal revision a durable block wins. */
@@ -241,4 +261,35 @@ export function preserveNativeSubagentRevisions<T extends SessionMessage>(
       return best.block;
     }),
   };
+}
+
+/** A refresh cursor can advance before native persistence catches up. Keep the newest
+ * revisions and omitted children of roots still present in the refresh, without carrying
+ * old transcript/progress blocks. An empty refresh or different root does not revive a tree. */
+export function preserveNativeSessionMessages<T extends SessionMessage>(
+  previous: readonly T[],
+  recent: T[],
+): T[] {
+  const roots = new Set(
+    recent.flatMap((message) =>
+      message.blocks.flatMap((block) => {
+        const native = block.kind === "subagent" && nativeSubagentMetadata(block);
+        return native ? [native.rootThreadId] : [];
+      }),
+    ),
+  );
+  if (!roots.size) return recent;
+  let messages = recent.map((message) => preserveNativeSubagentRevisions(previous, message));
+  for (const message of previous)
+    for (const block of message.blocks) {
+      const native = block.kind === "subagent" && nativeSubagentMetadata(block);
+      if (!native || native.nativeRevision === undefined || !roots.has(native.rootThreadId))
+        continue;
+      messages = upsertNativeSubagentMessage(messages, {
+        ...message,
+        id: `subagent:${native.threadId}`,
+        blocks: [block],
+      });
+    }
+  return messages;
 }

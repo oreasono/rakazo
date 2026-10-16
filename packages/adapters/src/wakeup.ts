@@ -4,6 +4,7 @@ import {
   dispatchBackgroundJob,
   type JobPublisher,
   type JobWorkerHost,
+  runJobKey,
 } from "@rakazo/adapter-kit";
 import { isTooManyDatabaseConnections } from "@rakazo/db";
 import { runCorrelatedJob, unwrapJobPayload, wrapJobPayload } from "@rakazo/logging";
@@ -23,6 +24,33 @@ export class GraphileJobPublisher implements JobPublisher {
 
   async enqueue(job: BackgroundJob): Promise<void> {
     const utils = await this.getUtils();
+    if (job.name === "run.continue" && job.payload.recoveryFence !== undefined) {
+      // The original unguarded wakeup must not replay after recovery reaches a
+      // human wait. Revalidate and lock the expired Run before its locked job:
+      // the reconciler's snapshot may predate a new attempt or human answer.
+      // Both row locks last through removal, so retirement cannot exhaust a
+      // newer job's retries or delete a concurrent, newly queued user answer.
+      // Retire before publishing: if publication fails, the expired Run remains
+      // eligible for the next reconciliation scan.
+      await utils.withPgClient(async (client) => {
+        await client.query(
+          `with eligible_run as materialized (
+             select id from runs
+             where id = $1 and "leaseFence" = $2
+               and status in ('leased', 'running')
+               and "leaseExpiresAt" <= (clock_timestamp() at time zone 'UTC')
+             for update
+           ), superseded as materialized (
+             select jobs.key from graphile_worker._private_jobs as jobs
+             join eligible_run on true
+             where jobs.key = $3 and jobs.locked_at is not null
+             for update of jobs
+           )
+           select graphile_worker.remove_job(key) from superseded`,
+          [job.payload.runId, job.payload.recoveryFence, runJobKey(job.payload.runId)],
+        );
+      });
+    }
     // replace resets attempts and run_at. unsafe_dedupe leaves both, so an
     // exhausted row would stay queued forever. Dedupe only while attempts remain.
     const jobKeyMode = await this.keepExistingMode(utils, job);
@@ -60,12 +88,26 @@ export class GraphileJobPublisher implements JobPublisher {
     const key = job.replaceKey;
     if (!job.keepExisting || !key) return undefined;
     const existing = await utils.withPgClient(async (client) => {
-      const found = await client.query<{ attempts: number; max_attempts: number }>(
-        "select attempts, max_attempts from graphile_worker._private_jobs where key = $1",
+      const found = await client.query<{
+        attempts: number;
+        max_attempts: number;
+        locked_at: Date | null;
+      }>(
+        "select attempts, max_attempts, locked_at from graphile_worker._private_jobs where key = $1",
         [key],
       );
       return found.rows[0];
     });
+    // A recovery worker can itself die after Graphile locks its wakeup but before
+    // it claims the Run. Replace that wakeup using Graphile's public addJob API;
+    // never unlock the old job or infer worker death from locked_at. The recovery
+    // fence and expired Run lease must still match atomically in the executor.
+    if (
+      job.name === "run.continue" &&
+      job.payload.recoveryFence !== undefined &&
+      existing?.locked_at
+    )
+      return undefined;
     if (!existing || Number(existing.attempts) >= Number(existing.max_attempts)) return undefined;
     return "unsafe_dedupe";
   }

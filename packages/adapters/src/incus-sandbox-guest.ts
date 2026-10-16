@@ -137,3 +137,21 @@ finally:
     p.wait()
 sys.exit(code)
 `;
+
+/** Runs only after the durable supervisor has dropped all root credentials. */
+export const INCUS_EXEC_CHILD_SCRIPT = `${WORKSPACE}
+import json, sys
+r = json.loads(sys.stdin.readline())
+fd = directory(r['root'], r['cwd'])
+os.fchdir(fd)
+os.close(fd)
+env = dict(os.environ)
+env.update(r['env'])
+for name in r['unsetEnv']:
+    env.pop(name, None)
+fd = os.open('/dev/null', os.O_RDONLY)
+os.dup2(fd, 0)
+if fd != 0:
+    os.close(fd)
+os.execvpe(r['argv'][0], r['argv'], env)
+`;

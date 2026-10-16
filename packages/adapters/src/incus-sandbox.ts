@@ -11,6 +11,7 @@ import type {
   ComputerObservation,
   ComputerRef,
   ControlLeaseRef,
+  ExecutionReconciliation,
   PortableFile,
   ProcessEvent,
   SandboxProvider,
@@ -18,6 +19,7 @@ import type {
   ScreenSession,
   SnapshotRef,
 } from "@rakazo/adapter-kit";
+import { INCUS_DURABLE_EXEC_SCRIPT } from "./incus-sandbox-durable.js";
 import { INCUS_EXEC_SCRIPT, INCUS_FILE_SCRIPT } from "./incus-sandbox-guest.js";
 import type { IncusProcessRequest, IncusProcessRunner } from "./incus-sandbox-process.js";
 import { runIncusProcess } from "./incus-sandbox-process.js";
@@ -251,6 +253,36 @@ export class IncusSandboxProvider implements SandboxProvider {
     }
     const release = await this.acquire(binding, context);
     try {
+      if (request.operationId !== undefined) {
+        const receipt = await this.durableExecution(
+          binding,
+          {
+            op: "execute",
+            operationId: executionId(request.operationId),
+            command: {
+              argv: command,
+              root: binding.workspacePath,
+              cwd,
+              env: request.env ?? {},
+              unsetEnv: [...new Set(request.unsetEnv ?? [])].sort(),
+              timeoutMs,
+              maxOutputBytes: this.maxOutputBytes,
+              guestUser: this.guestUser,
+              display: this.display,
+            },
+          },
+          timeoutMs + 10_000,
+          context,
+        );
+        if (receipt.status !== "completed")
+          throw new Error(
+            `Incus execution ${receipt.status}; reconcile operationId without redispatch`,
+          );
+        if (receipt.result.stdout) yield { type: "stdout", data: receipt.result.stdout };
+        if (receipt.result.stderr) yield { type: "stderr", data: receipt.result.stderr };
+        yield { type: "exit", code: receipt.result.code };
+        return;
+      }
       yield* this.stream({
         argv: this.guestArgv(binding, ["python3", "-u", "-c", INCUS_EXEC_SCRIPT]),
         input: `${JSON.stringify({
@@ -269,6 +301,21 @@ export class IncusSandboxProvider implements SandboxProvider {
     } finally {
       release();
     }
+  }
+
+  async reconcileExecution(
+    computer: ComputerRef,
+    operationId: string,
+    context: AdapterContext,
+  ): Promise<ExecutionReconciliation> {
+    const binding = this.authorize(computer, context);
+    // Do not queue behind a running command: a live supervisor must be observable.
+    return this.durableExecution(
+      binding,
+      { op: "query", operationId: executionId(operationId) },
+      this.operationTimeoutMs,
+      context,
+    );
   }
 
   async connectScreen(
@@ -530,6 +577,71 @@ export class IncusSandboxProvider implements SandboxProvider {
     ]);
   }
 
+  private async durableExecution(
+    binding: Binding,
+    payload: { op: "execute" | "query"; operationId: string; command?: unknown },
+    timeoutMs: number,
+    context: AdapterContext,
+  ): Promise<ExecutionReconciliation> {
+    const response = await this.collect({
+      argv: this.hostArgv([
+        "exec",
+        this.target(binding),
+        "--mode",
+        "non-interactive",
+        "--user",
+        "0",
+        "--group",
+        "0",
+        "--",
+        "/usr/bin/python3",
+        "-I",
+        "-u",
+        "-c",
+        INCUS_DURABLE_EXEC_SCRIPT,
+      ]),
+      input: `${JSON.stringify({
+        ...payload,
+        identity: {
+          project: this.project,
+          remote: this.remote,
+          instance: binding.instance,
+          computerId: binding.providerRef,
+          spaceId: binding.spaceId,
+          botId: binding.botId,
+          ownerBotId: binding.ownerBotId,
+        },
+      })}\n`,
+      // Durable execution intentionally survives stdin EOF and receiver death.
+      timeoutMs,
+      maxOutputBytes: 6 * this.maxOutputBytes + 16384,
+      signal: context.signal,
+    });
+    if (response.code !== 0) {
+      if (response.stderr.trim() === "execution operationId command mismatch")
+        throw new Error("Incus execution operationId command mismatch");
+      throw new Error("Incus durable execution journal unavailable");
+    }
+    const value: unknown = JSON.parse(response.stdout);
+    if (record(value)) {
+      if (value.status === "pending" || value.status === "unknown") return { status: value.status };
+      if (value.status === "completed" && record(value.result)) {
+        const { stdout, stderr, code } = value.result;
+        if (
+          typeof stdout === "string" &&
+          typeof stderr === "string" &&
+          typeof code === "number" &&
+          Number.isInteger(code) &&
+          code >= 0 &&
+          code <= 255 &&
+          Buffer.byteLength(stdout) + Buffer.byteLength(stderr) <= this.maxOutputBytes
+        )
+          return { status: "completed", result: { stdout, stderr, code } };
+      }
+    }
+    throw new Error("Invalid Incus execution receipt");
+  }
+
   private async collect(
     request: IncusProcessRequest,
   ): Promise<{ stdout: string; stderr: string; code: number }> {
@@ -784,6 +896,16 @@ function record(value: unknown): value is Record<string, unknown> {
 }
 function identifier(value: string, name: string): string {
   if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$/.test(value)) throw new Error(`Invalid Incus ${name}`);
+  return value;
+}
+function executionId(value: string): string {
+  if (
+    !value ||
+    typeof value !== "string" ||
+    value.includes("\0") ||
+    Buffer.byteLength(value) > 1024
+  )
+    throw new Error("Invalid Incus execution operationId");
   return value;
 }
 function argv(value: readonly string[]): string[] {

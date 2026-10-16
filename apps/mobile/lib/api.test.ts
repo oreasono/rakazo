@@ -3283,6 +3283,113 @@ describe("native Codex recovery", () => {
 });
 
 describe("native revision ordering", () => {
+  it.each([false, true])(
+    "keeps recovery revisions monotonic through refresh (history=%s)",
+    (history) => {
+      const native = (id: string, nativeStatus: string, nativeRevision: number) => ({
+        kind: "subagent" as const,
+        runtime: "codex" as const,
+        agentId: id,
+        threadId: id,
+        rootThreadId: "root",
+        parentThreadId: id === "root" ? null : "root",
+        name: id,
+        task: "",
+        status:
+          nativeStatus === "recovering"
+            ? ("running" as const)
+            : nativeStatus === "completed"
+              ? ("completed" as const)
+              : ("failed" as const),
+        nativeStatus,
+        nativeRevision,
+      });
+      const interrupted = snapshot([
+        mobileMessage("stored-root", [native("root", "interrupted", 1)], 1),
+        mobileMessage("stored-child", [native("child", "interrupted", 2)], 2),
+      ]);
+      let current: MobileSnapshot | null = JSON.parse(JSON.stringify(interrupted));
+      for (const [index, id] of ["root", "child"].entries())
+        current = applyMobileThreadEvent(current, {
+          type: "thread.subagent",
+          seq: 900 + index,
+          payload: native(id, "recovering", 3 + index),
+        });
+      current = applyMobileThreadEvent(current, {
+        type: "thread.progress",
+        seq: 902,
+        payload: { text: "Old draft" },
+      });
+      const refreshed = mergeMobileSnapshot(
+        current,
+        {
+          ...interrupted,
+          cursor: 903,
+          messages: [interrupted.messages[0]!],
+        },
+        history,
+      );
+      expect(buildNativeSessionTrees(refreshed.messages)[0]?.nodes).toMatchObject([
+        { threadId: "root", nativeStatus: "recovering", nativeRevision: 3 },
+        {
+          threadId: "child",
+          parentThreadId: "root",
+          nativeStatus: "recovering",
+          nativeRevision: 4,
+        },
+      ]);
+      expect(JSON.stringify(refreshed.messages)).not.toContain("Old draft");
+      current = JSON.parse(JSON.stringify(refreshed));
+      for (const [index, id] of ["root", "child"].entries())
+        current = applyMobileThreadEvent(current, {
+          type: "thread.message.updated",
+          seq: 904 + index,
+          payload: { messageId: `stored-${id}`, blocks: [native(id, "completed", 5 + index)] },
+        });
+      const restored = mergeMobileSnapshot(current, { ...interrupted, cursor: 906 }, history);
+      expect(restored.messages).toHaveLength(2);
+      expect(buildNativeSessionTrees(restored.messages)[0]?.nodes).toMatchObject([
+        { threadId: "root", status: "completed", nativeStatus: "completed", nativeRevision: 5 },
+        { threadId: "child", status: "completed", nativeStatus: "completed", nativeRevision: 6 },
+      ]);
+      const needsReview = applyMobileThreadEvent(restored, {
+        type: "thread.subagent",
+        seq: 907,
+        payload: native("child", "recovery_required", 7),
+      });
+      const stale = applyMobileThreadEvent(needsReview, {
+        type: "thread.subagent",
+        seq: 908,
+        payload: native("child", "completed", 6),
+      });
+      expect(buildNativeSessionTrees(stale?.messages ?? [])[0]?.nodes[1]).toMatchObject({
+        status: "failed",
+        nativeStatus: "recovery_required",
+        nativeRevision: 7,
+      });
+      const persisted = mergeMobileSnapshot(
+        stale,
+        {
+          ...interrupted,
+          cursor: 909,
+          messages: [
+            mobileMessage("stored-root", [native("root", "completed", 8)], 20),
+            mobileMessage("stored-child", [native("child", "recovery_required", 9)], 21),
+          ],
+        },
+        history,
+      );
+      expect(
+        buildNativeSessionTrees(persisted.messages)[0]?.nodes.map((node) => node.nativeRevision),
+      ).toEqual([8, 9]);
+      expect(
+        mergeMobileSnapshot(stale, { ...snapshot([]), cursor: 909 }, history).messages,
+      ).toEqual([]);
+      const other = { ...interrupted, threadId: "other-thread", cursor: 909 };
+      expect(mergeMobileSnapshot(stale, other, history)).toBe(other);
+    },
+  );
+
   it("rejects a higher event seq with an older native revision and preserves a resumed revision across late persistence", () => {
     const native = {
       kind: "subagent" as const,

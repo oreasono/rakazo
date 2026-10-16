@@ -2,9 +2,10 @@ import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentRunRequest, AgentRuntimeEvent } from "@rakazo/adapter-kit";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CodexConnectionOptions, CodexObject } from "./codex-app-server.js";
 import { CodexAgentRuntime } from "./codex-runtime.js";
+import { CodexToolJournal } from "./codex-tool-journal.js";
 
 const temporary: string[] = [];
 afterEach(async () => {
@@ -235,4 +236,93 @@ describe("Codex-owned runtime", () => {
       false,
     );
   });
+
+  it.each(["completed", "unknown"] as const)(
+    "reconciles a crashed run with a %s execution receipt",
+    async (outcome) => {
+      const root = await directory();
+      const fake = fakeServer();
+      const runtime = () =>
+        new CodexAgentRuntime({ sessionRoot: root, connectionFactory: fake.factory });
+      await collect(runtime().run(input()));
+      const home = join(root, (await readdir(root))[0]!);
+      const stateFile = join(home, "session.json");
+      const state = JSON.parse(await readFile(stateFile, "utf8"));
+      state.runs["run-one"] = { status: "running", journalVersion: 1, turnId: "native-turn-1" };
+      for (const node of Object.values(state.nodes) as Array<Record<string, unknown>>) {
+        node.status = "running";
+        node.nativeStatus = "running";
+      }
+      await writeFile(stateFile, JSON.stringify(state));
+      const tool = { name: "shell", description: "test", inputSchema: { type: "object" } };
+      const request: AgentRunRequest = {
+        ...input(),
+        tools: [tool],
+        executeTool: vi.fn(async () => {
+          throw new Error("reply lost after append");
+        }),
+        reconcileTool: vi.fn(async () =>
+          outcome === "completed"
+            ? {
+                status: "completed" as const,
+                result: { stdout: "append count=1", stderr: "", code: 0 },
+              }
+            : { status: "unknown" as const },
+        ),
+      };
+      const journal = new CodexToolJournal(
+        join(home, "operations"),
+        request,
+        new AbortController().signal,
+      );
+      await expect(journal.execute(tool, { command: "append once" }, "operation")).rejects.toThrow(
+        "needs review",
+      );
+      const events: AgentRuntimeEvent[] = [];
+      const recover = async () => {
+        for await (const event of runtime().run(request)) events.push(event);
+      };
+      if (outcome === "unknown") {
+        await expect(recover()).rejects.toThrow("needs review");
+        expect(events).toContainEqual(
+          expect.objectContaining({
+            type: "subagent",
+            agentId: "native-child",
+            nativeStatus: "recovery_required",
+            status: "failed",
+          }),
+        );
+        expect(fake.calls.filter((call) => call.method === "turn/start")).toHaveLength(1);
+        expect(JSON.parse(await readFile(stateFile, "utf8")).runs["run-one"].status).toBe(
+          "recovery_required",
+        );
+      } else {
+        await recover();
+        expect(events).toContainEqual(
+          expect.objectContaining({
+            type: "subagent",
+            agentId: "native-child",
+            nativeStatus: "recovering",
+          }),
+        );
+        expect(events).toContainEqual(
+          expect.objectContaining({
+            type: "subagent",
+            agentId: "native-child",
+            nativeStatus: "interrupted",
+          }),
+        );
+        const starts = fake.calls.filter((call) => call.method === "turn/start");
+        expect(starts).toHaveLength(2);
+        expect(JSON.stringify(starts[1]?.params)).toContain("append count=1");
+        expect(JSON.stringify(starts[1]?.params)).not.toContain(input().prompt);
+        expect(fake.connections.at(-1)?.args).toContain("features.multi_agent=false");
+        expect(fake.calls.filter((call) => call.method === "thread/start")).toHaveLength(1);
+        await collect(runtime().run(request));
+        expect(fake.calls.filter((call) => call.method === "turn/start")).toHaveLength(2);
+      }
+      expect(request.executeTool).toHaveBeenCalledTimes(1);
+      expect(request.reconcileTool).toHaveBeenCalledTimes(1);
+    },
+  );
 });
