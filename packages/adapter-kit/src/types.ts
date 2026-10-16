@@ -564,6 +564,15 @@ export type AgentRuntimeEvent =
   | { type: "checkpoint"; blob: string }
   | {
       type: "subagent";
+      /** Native Codex identity; include all four fields and set agentId = threadId.
+       * Consumers persist the metadata in both live events and durable message blocks. */
+      runtime?: "codex";
+      rootThreadId?: string;
+      parentThreadId?: string | null;
+      threadId?: string;
+      nativeStatus?: string;
+      /** Persisted root-session revision; message/event seq counters are unrelated. */
+      nativeRevision?: number;
       agentId: string;
       name: string;
       task: string;

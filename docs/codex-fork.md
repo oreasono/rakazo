@@ -1,9 +1,14 @@
 # Codex runtime and self-hosted computers
 
-Status: foundation, 2026-10-16. This branch has an architecture decision and an
-account-free protocol probe. It has **not** switched the Rakazo worker to Codex,
-connected a VM through Rakazo, or completed a live voice call. No fork release
-is available. Preserve the upstream Apache-2.0 license and attribution.
+Status: initial live chain accepted, 2026-10-16. The real API and independent worker
+delegated to a native Codex child on a temporary Incus Ubuntu VM, verified its nonce
+through external readback, and retained the same native root after restarting the
+worker between completed turns. The real web root/child tree was visually verified
+in the viewport before and after refresh, with matching tree-image hashes. Mid-turn crash replay,
+native app sessions and other operating systems remain outside this acceptance.
+See [current status and configuration](codex-fork-status.md).
+No fork release or live Codex voice acceptance is available. Preserve the upstream
+Apache-2.0 license and attribution.
 
 ## Decision and ownership
 
@@ -16,7 +21,9 @@ The computer service owns target routing and execution, without another model lo
 ```mermaid
 flowchart TD
   UI[Web / Electron / Expo] --> API[Product API and event projection]
-  API --> C[Codex app-server: root and native child threads]
+  API --> Q[Durable product queue]
+  Q --> WK[Worker / CodexAgentRuntime]
+  WK --> C[Codex app-server: root and native child threads]
   UI --> VOICE[Client audio: WebRTC or streamed audio]
   VOICE --> C
   C --> RT[Configured realtime service]
@@ -51,13 +58,17 @@ tool; knowing a thread ID must not grant authority over it.
 The probe exercises initialize, two independent thread creations and the local
 voice catalog. It inspects generated schemas for resume, fork, turns and realtime.
 It does **not** prove model execution, native delegation, durable resume or a voice
-call. Native delegation and restart recovery were validated in a separate PAC
-integration; they must be repeated through this fork before acceptance.
+call. Native delegation and completed-turn restart recovery have now also passed
+through this fork's real API/worker, beyond the earlier separate PAC integration.
 
 ## Runtime integration rules
 
 - Preserve a stable Codex thread and its state directory across worker restarts.
   UI transcripts are projections; do not resubmit old messages as new prompts.
+  The current adapter stores bindings under `DATA_DIR/codex-sessions`. The first
+  live recovery gate restarts the worker between two completed turns. An admitted
+  run whose outcome is ambiguous after a crash is refused automatic replay; a new
+  user message can resume the same conversation after the operator checks its state.
 - Route events by thread/turn/request ID. A child event is not a root-thread
   identity error. Only accept descendants established by trusted runtime events.
 - Keep pending approvals bound to the original request and process connection.
@@ -89,6 +100,13 @@ Windows through their actual host managers and guest drivers. Incus guest-agent
 command/file support does not establish GUI support. Validate the macOS logged-in
 desktop and permissions; run Windows GUI operations in an interactive user session.
 
+The initial Incus adapter attaches only to instances in a deployment-owned JSON
+allowlist. It does not create desktops. Its current capabilities include guest
+commands, files, screenshots and GUI actions; PTY, screen streaming/takeover,
+snapshots and multiple screens are unsupported. These are implementation boundaries
+to close after the first real product acceptance, not capabilities implied by the
+upstream client UI.
+
 Enforce per-thread computer grants in the service. The model cannot enlarge them
 by supplying a different ID. Default to one input writer per interactive desktop;
 use separate VMs for parallel children. Human takeover revokes the agent's current
@@ -117,11 +135,11 @@ connection material appropriate to their transport.
 
 ## Ordered acceptance gates
 
-1. **Codex + Ubuntu through Rakazo.** A message creates a real native child. The
-   child writes a random marker through the guest GUI/tool path, and an independent
-   read confirms it on the intended VM. The root summarizes it and the client
-   displays the real thread tree. Restart/resume, approval and interruption pass
-   without duplicated effects.
+1. **Codex + Ubuntu through Rakazo.** Native delegation, guest tool marker write,
+   independent readback, durable/web tree identity and same-root worker recovery
+   between completed turns passed on 2026-10-16. Viewport tree screenshots before
+   and after refresh were visually accepted. Approval/interruption recovery and hard-crash handling without
+   duplicated effects are still separate, unaccepted cases.
 2. **Mixed computers.** One root delegates work to Ubuntu, macOS and Windows.
    Independently read back each artifact; test routing, screen input, takeover,
    locked/logged-out desktops and unavailable capabilities.

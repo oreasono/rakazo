@@ -1,6 +1,10 @@
 vi.mock("./ai-consent", () => ({ promptAiConsent: vi.fn() }));
 
-import { isServerUnreachable, withLiveStreamingProgress } from "@rakazo/core";
+import {
+  buildNativeSessionTrees,
+  isServerUnreachable,
+  withLiveStreamingProgress,
+} from "@rakazo/core";
 import * as SecureStore from "expo-secure-store";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { promptAiConsent } from "./ai-consent";
@@ -3224,4 +3228,99 @@ it("localizes non-JSON successful account-security responses", async () => {
     vi.fn(async () => new Response("<html>Gateway error</html>")),
   );
   await expect(fetchAccountSecurity()).rejects.toThrow("Could not load sign-in options");
+});
+
+describe("native Codex recovery", () => {
+  it("rebuilds the same tree from durable messages and accepts a later resume without duplicating cards", () => {
+    const native = {
+      kind: "subagent" as const,
+      runtime: "codex" as const,
+      agentId: "native-child",
+      threadId: "native-child",
+      rootThreadId: "native-root",
+      parentThreadId: "native-root",
+      name: "Research",
+      task: "Read the screen",
+      status: "running" as const,
+    };
+    const live = applyMobileThreadEvent(snapshot([]), {
+      type: "thread.subagent",
+      seq: 4,
+      payload: native,
+    });
+    expect(buildNativeSessionTrees(live?.messages ?? [])[0]?.nodes[1]).toMatchObject({
+      threadId: "native-child",
+      parentThreadId: "native-root",
+      status: "running",
+    });
+    const durable = applyMobileThreadEvent(live, {
+      type: "thread.message.created",
+      seq: 5,
+      payload: { messageId: "stored-native", blocks: [{ ...native, status: "completed" }] },
+    });
+    const restored = JSON.parse(JSON.stringify(durable));
+    expect(buildNativeSessionTrees(restored.messages)[0]?.nodes[1]?.status).toBe("completed");
+    expect(
+      applyMobileThreadEvent(restored, { type: "thread.subagent", seq: 4, payload: native }),
+    ).toBe(restored);
+    const resumed = applyMobileThreadEvent(restored, {
+      type: "thread.subagent",
+      seq: 6,
+      payload: native,
+    });
+    expect(resumed?.messages).toHaveLength(1);
+    expect(resumed?.messages[0]?.id).toBe("stored-native");
+    expect(buildNativeSessionTrees(resumed?.messages ?? [])[0]?.nodes[1]?.status).toBe("running");
+    expect(
+      applyMobileThreadEvent(resumed, {
+        type: "thread.message.updated",
+        seq: 5,
+        payload: { messageId: "stored-native", blocks: [{ ...native, status: "completed" }] },
+      }),
+    ).toBe(resumed);
+    expect(mergeMobileSnapshot(resumed, restored)).toBe(resumed);
+  });
+});
+
+describe("native revision ordering", () => {
+  it("rejects a higher event seq with an older native revision and preserves a resumed revision across late persistence", () => {
+    const native = {
+      kind: "subagent" as const,
+      runtime: "codex" as const,
+      agentId: "native-child",
+      threadId: "native-child",
+      rootThreadId: "native-root",
+      parentThreadId: "native-root",
+      name: "Research",
+      task: "",
+      status: "completed" as const,
+      nativeRevision: 12,
+    };
+    const stored = snapshot([mobileMessage("stored", [native], 2)]);
+    const stale = applyMobileThreadEvent(stored, {
+      type: "thread.subagent",
+      seq: 900,
+      payload: { ...native, nativeRevision: 11, status: "running" },
+    });
+    expect(buildNativeSessionTrees(stale?.messages ?? [])[0]?.nodes[1]).toMatchObject({
+      status: "completed",
+      nativeRevision: 12,
+    });
+    const resumed = applyMobileThreadEvent(stale, {
+      type: "thread.subagent",
+      seq: 901,
+      payload: { ...native, nativeRevision: 13, status: "running" },
+    });
+    expect(resumed?.messages[0]?.seq).toBe(2);
+    const late = applyMobileThreadEvent(resumed, {
+      type: "thread.message.updated",
+      seq: 902,
+      payload: { messageId: "stored", blocks: [native] },
+    });
+    expect(late?.messages).toHaveLength(1);
+    expect(buildNativeSessionTrees(late?.messages ?? [])[0]?.nodes[1]).toMatchObject({
+      status: "running",
+      nativeRevision: 13,
+    });
+  });
 });

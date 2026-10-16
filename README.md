@@ -1,10 +1,22 @@
 # Rakazo
 
-> **Codex fork — foundation branch.** This fork is developing a Codex-owned runtime
-> with self-hosted Linux, macOS and Windows computers. The implementation plan and
-> acceptance gates are in [the fork architecture](docs/codex-fork.md). The product
-> runtime is still upstream Rakazo at this stage; the downloads and feature list
-> below describe upstream, not a released build of this fork.
+> **Codex fork — initial live chain accepted (2026-10-16).** A real product API/worker
+> run delegated to a native Codex child on a temporary Incus Ubuntu VM, verified the
+> result independently, and resumed the same native root after a worker restart
+> between completed turns. The real web root/child tree was visually verified
+> before and after refresh, with matching screenshot hashes. This does not establish
+> mid-turn crash replay, native mobile/desktop app acceptance or realtime voice.
+> See [current status and configuration](docs/codex-fork-status.md)
+> and [architecture](docs/codex-fork.md). The published downloads below are upstream
+> Rakazo releases; they do not contain this fork's changes.
+
+For this fork, run from source with `AGENT_RUNTIME=codex`, an installed Codex CLI and
+a Responses-compatible model connection. To attach a preallocated Ubuntu desktop,
+set `SANDBOX_PROVIDER=incus` and `INCUS_CONFIG_FILE` on both API and worker. Keep
+`DATA_DIR` stable across worker restarts. Public custom model endpoints require
+`RAKAZO_OPENAI_COMPAT_ALLOW_PUBLIC=1`; configure credentials through the product's
+OpenAI-compatible connection. See the [isolated live acceptance instructions](scripts/accept-codex-incus.md).
+macOS/Windows backends and Codex realtime voice integration remain planned.
 
 [![GitHub stars](https://img.shields.io/github/stars/elie222/rakazo?labelColor=black&style=for-the-badge&color=2563EB)](https://github.com/elie222/rakazo/stargazers)
 [![Discord](https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?labelColor=black&style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/RWwKa2Sn7h)
@@ -41,7 +53,7 @@ gateway is a separate process.
 - [All comparisons](https://rakazo.com/alternatives/)
 - [Self-hosting guide](https://rakazo.com/self-hosted-ai-agent/)
 
-## Features
+## Upstream features
 
 - Persistent bots with their own conversations, memory, routines, and history
 - Voice mode: speak replies, dictate, and call a bot. Bring your own ElevenLabs, OpenAI, Cartesia, or Fish Audio key
@@ -69,7 +81,7 @@ https://github.com/user-attachments/assets/dccdeddb-2134-4a56-8eed-b2e591736b1c
 - Docker, E2B, Daytona, CreateOS, and Box
 - Composio, Pipedream Connect, MCP, and OpenAPI integrations
 
-## Quick start (published images)
+## Upstream quick start (published images)
 
 You need Docker Engine, the Compose plugin, curl, and OpenSSL. No clone or Node install.
 
@@ -112,6 +124,11 @@ covers the Caddy setup and host hardening. In the desktop app choose **Existing 
 the `https://` address.
 
 ## Local development (source checkout)
+
+This section describes the upstream Docker development layout. For the Codex/Incus
+fork, use [the fork configuration](docs/codex-fork-status.md#configuration) and the
+[isolated acceptance launcher](scripts/accept-codex-incus.md). Existing Compose and
+desktop installers do not yet install or pin a Codex binary for this fork.
 
 You need Node.js 22.22.2 or newer in the 22.x line, Node.js 24.x, or Node.js 26+;
 pnpm 9; and Docker. Node.js 23.x and 25.x are not supported.

@@ -4,7 +4,7 @@ import type {
   ThreadMessage,
   ThreadSnapshot,
 } from "@rakazo/contracts";
-import { withLiveStreamingProgress } from "@rakazo/core";
+import { buildNativeSessionTrees, withLiveStreamingProgress } from "@rakazo/core";
 import { describe, expect, it } from "vitest";
 import {
   activeThreadRuns,
@@ -1761,3 +1761,111 @@ function event(overrides: Partial<ProductEvent>): ProductEvent {
     ...overrides,
   };
 }
+
+describe("native Codex recovery", () => {
+  it("rebuilds the same tree from durable messages and accepts a later resume without duplicating cards", () => {
+    const native = {
+      kind: "subagent" as const,
+      runtime: "codex" as const,
+      agentId: "native-child",
+      threadId: "native-child",
+      rootThreadId: "native-root",
+      parentThreadId: "native-root",
+      name: "Research",
+      task: "Read the screen",
+      status: "running" as const,
+    };
+    const live = reduceThreadSnapshot(
+      snapshot([]),
+      event({ type: "thread.subagent", seq: 4, payload: native }),
+    );
+    expect(buildNativeSessionTrees(live?.messages ?? [])[0]?.nodes[1]).toMatchObject({
+      threadId: "native-child",
+      parentThreadId: "native-root",
+      status: "running",
+    });
+    const durable = reduceThreadSnapshot(
+      live,
+      event({
+        type: "thread.message.created",
+        seq: 5,
+        payload: { messageId: "stored-native", blocks: [{ ...native, status: "completed" }] },
+      }),
+    );
+    const restored = JSON.parse(JSON.stringify(durable));
+    expect(buildNativeSessionTrees(restored.messages)[0]?.nodes[1]?.status).toBe("completed");
+    expect(
+      reduceThreadSnapshot(restored, event({ type: "thread.subagent", seq: 4, payload: native })),
+    ).toBe(restored);
+    const resumed = reduceThreadSnapshot(
+      restored,
+      event({ type: "thread.subagent", seq: 6, payload: native }),
+    );
+    expect(resumed?.messages).toHaveLength(1);
+    expect(resumed?.messages[0]?.id).toBe("stored-native");
+    expect(buildNativeSessionTrees(resumed?.messages ?? [])[0]?.nodes[1]?.status).toBe("running");
+    expect(
+      reduceThreadSnapshot(
+        resumed,
+        event({
+          type: "thread.message.updated",
+          seq: 5,
+          payload: { messageId: "stored-native", blocks: [{ ...native, status: "completed" }] },
+        }),
+      ),
+    ).toBe(resumed);
+    expect(mergeThreadSnapshot(resumed, restored)).toBe(resumed);
+  });
+});
+
+describe("native revision ordering", () => {
+  it("rejects a higher event seq with an older native revision and preserves a resumed revision across late persistence", () => {
+    const native = {
+      kind: "subagent" as const,
+      runtime: "codex" as const,
+      agentId: "native-child",
+      threadId: "native-child",
+      rootThreadId: "native-root",
+      parentThreadId: "native-root",
+      name: "Research",
+      task: "",
+      status: "completed" as const,
+      nativeRevision: 12,
+    };
+    const stored = snapshot([message("stored", [native], 2)]);
+    const stale = reduceThreadSnapshot(
+      stored,
+      event({
+        type: "thread.subagent",
+        seq: 900,
+        payload: { ...native, nativeRevision: 11, status: "running" },
+      }),
+    );
+    expect(buildNativeSessionTrees(stale?.messages ?? [])[0]?.nodes[1]).toMatchObject({
+      status: "completed",
+      nativeRevision: 12,
+    });
+    const resumed = reduceThreadSnapshot(
+      stale,
+      event({
+        type: "thread.subagent",
+        seq: 901,
+        payload: { ...native, nativeRevision: 13, status: "running" },
+      }),
+    );
+    expect(resumed?.messages[0]?.seq).toBe(2);
+    const late = reduceThreadSnapshot(
+      resumed,
+      event({
+        type: "thread.message.updated",
+        seq: 902,
+        payload: { messageId: "stored", blocks: [native] },
+      }),
+    );
+    expect(late?.messages).toHaveLength(1);
+    expect(buildNativeSessionTrees(late?.messages ?? [])[0]?.nodes[1]).toMatchObject({
+      status: "running",
+      nativeRevision: 13,
+    });
+  });
+});

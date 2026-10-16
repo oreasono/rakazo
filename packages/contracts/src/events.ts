@@ -93,6 +93,19 @@ const ChartBlock = z
 export const SecretAskPurpose = z.enum(["otp", "password", "api_key"]);
 export type SecretAskPurpose = z.infer<typeof SecretAskPurpose>;
 
+/** Optional on legacy subagent cards. For Codex, all IDs are native app-server thread IDs;
+ * agentId must equal threadId. Persist these fields on terminal messages as well as events. */
+export const NativeSubagentMetadata = z.object({
+  runtime: z.literal("codex"),
+  rootThreadId: z.string().min(1),
+  parentThreadId: z.string().min(1).nullable(),
+  threadId: z.string().min(1),
+  nativeStatus: z.string().optional(),
+  /** Monotonic root-session revision, independent of Message.seq and Event.seq. */
+  nativeRevision: z.number().int().nonnegative().optional(),
+});
+export type NativeSubagentMetadata = z.infer<typeof NativeSubagentMetadata>;
+
 export const MessageBlock = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("text"), text: z.string() }),
   z.object({
@@ -177,6 +190,7 @@ export const MessageBlock = z.discriminatedUnion("kind", [
   }),
   z.object({
     kind: z.literal("subagent"),
+    ...NativeSubagentMetadata.partial().shape,
     agentId: z.string(),
     name: z.string(),
     task: z.string(),

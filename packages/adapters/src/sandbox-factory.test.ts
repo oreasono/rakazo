@@ -52,7 +52,21 @@ describe("createSandboxProvider", () => {
 
   it("throws on unknown provider", () => {
     expect(() => createSandboxProvider("bogus", {})).toThrow(
-      'Unknown SANDBOX_PROVIDER "bogus". Use none | docker | e2b | daytona | createos | box | railway | e2b-emulator | daytona-emulator | box-emulator | desktop | fake.',
+      'Unknown SANDBOX_PROVIDER "bogus". Use none | docker | e2b | daytona | createos | box | railway | incus | e2b-emulator | daytona-emulator | box-emulator | desktop | fake.',
     );
+  });
+
+  it("requires an explicit Incus allowlist without falling back to another computer", () => {
+    expect(() => createSandboxProvider("incus", {})).toThrow(/INCUS_CONFIG_FILE/);
+    const sandbox = createSandboxProvider("incus", {
+      incus: {
+        project: "test-project",
+        instances: [{ instance: "test-vm", spaceId: "ws", botId: "b" }],
+      },
+    });
+    expect(sandbox.describe()).toMatchObject({
+      id: "incus",
+      capabilities: { takeover: false, pty: false },
+    });
   });
 });

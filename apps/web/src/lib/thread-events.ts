@@ -14,7 +14,9 @@ import {
   isBackgroundRunTrigger,
   isRunTerminalEvent,
   mergeThreadHistory,
+  nativeSubagentMetadata,
   prependThreadHistoryPage,
+  preserveNativeSubagentRevisions,
   progressMessageId,
   reduceLiveMessageBlocks,
   replyMetadata,
@@ -23,6 +25,7 @@ import {
   takeLiveMessage,
   updateCloudAgentMessages,
   upsertMessageById,
+  upsertNativeSubagentMessage,
 } from "@rakazo/core";
 
 const runTriggers = new Set<string>(RUN_TRIGGERS);
@@ -452,6 +455,14 @@ export function reduceThreadSnapshot(
       runId: event.runId,
       createdAt: event.createdAt,
     };
+    if (nativeSubagentMetadata(block)) {
+      if (event.seq <= prev.cursor) return prev;
+      return {
+        ...prev,
+        cursor: event.seq,
+        messages: upsertNativeSubagentMessage(prev.messages, next),
+      };
+    }
     const without: ThreadMessage[] = [];
     const kept: ThreadMessage[] = [];
     for (const message of prev.messages) {
@@ -475,9 +486,14 @@ export function reduceThreadSnapshot(
   if (event.type === "thread.message.created" || event.type === "thread.message.updated") {
     const role = (event.payload.role as ThreadMessage["role"]) ?? "bot";
     const blocks = (event.payload.blocks as ThreadMessage["blocks"]) ?? [];
+    if (
+      blocks.some((block) => block.kind === "subagent" && nativeSubagentMetadata(block)) &&
+      event.seq <= prev.cursor
+    )
+      return prev;
     const id = String(event.payload.messageId ?? event.id);
     const known = prev.messages.find((message) => message.id === id);
-    const next: ThreadMessage = {
+    const next: ThreadMessage = preserveNativeSubagentRevisions(prev.messages, {
       id,
       threadId: event.threadId,
       seq: event.seq,
@@ -488,7 +504,7 @@ export function reduceThreadSnapshot(
       callId: typeof event.payload.callId === "string" ? event.payload.callId : known?.callId,
       ...replyMetadata(event.payload, known),
       createdAt: known?.createdAt ?? event.createdAt,
-    };
+    });
     const replacedSubagentIds = new Set(
       blocks.filter((block) => block.kind === "subagent").map((block) => block.agentId),
     );

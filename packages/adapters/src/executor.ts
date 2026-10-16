@@ -78,6 +78,7 @@ import {
   messagingChannelId,
   messagingChannelPrivacyBlock,
   messagingDmSurfaceNote,
+  nativeSubagentMetadata,
   nextCronDateAcross,
   nextFence,
   planActionGate,
@@ -2948,7 +2949,10 @@ export function isTerminalModelSetupError(error: unknown): boolean {
 }
 
 export function createRunExecutor(deps: ExecutorDeps) {
-  const contextStrategy = deps.contextStrategy ?? DEFAULT_CONTEXT_STRATEGY;
+  const codexOwned = deps.runtime?.describe?.().id === "codex";
+  const contextStrategy = codexOwned
+    ? "current"
+    : (deps.contextStrategy ?? DEFAULT_CONTEXT_STRATEGY);
   const web = deps.web ?? createWebProvider();
   const browser = deps.browser ?? createBrowserProvider(undefined, { sandbox: deps.sandbox });
   const cloudAgent = deps.cloudAgent;
@@ -3817,6 +3821,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
         const pageBrowserAllowed =
           graphical && browser.describe().capabilities.page && !heldForTakeover;
         const disabledBuiltinTools = disabledBuiltinToolSet(bot.disabledBuiltinTools);
+        if (codexOwned) disabledBuiltinTools.add("run_subagent");
         const builtins = [
           ...selectBuiltinToolsForRun({
             ticketBoardEnabled: deps.ticketBoardEnabled,
@@ -3829,7 +3834,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
             cloudAgentEnabled: cloudAgentsEnabled(cloudAgent, run.spaceId),
             messagingChannelRun,
             voiceCall,
-            disabledBuiltinTools: bot.disabledBuiltinTools,
+            disabledBuiltinTools: [...disabledBuiltinTools],
           }),
           // Cross-owner agent connections only exist for chat-linked bots.
           ...(hasMessagingIdentity && !isBackgroundRunTrigger(run.trigger)
@@ -3905,6 +3910,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
         // messageSegments). Treat that like tool/step durable activity so we do not invent
         // an empty-run "done." completion afterward.
         let publishedTerminalSubagent = false;
+        const nativeProjectionKeys = new Map<string, string>();
         // Durable chat messages posted mid-turn (message_user / promoted narration).
         // Rehydrate from this run's prior progress rows so a resume after ask/takeover
         // still knows progress was already published (skip hollow finals; status outcome).
@@ -6534,7 +6540,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
               })
                 .filter((instruction): instruction is string => Boolean(instruction))
                 .join("\n\n"),
-              history: runtimeHistory,
+              history: codexOwned ? [] : runtimeHistory,
               currentTurnImages,
               tools,
               model: {
@@ -6949,6 +6955,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
                 }
               }
             } else if (event.type === "subagent") {
+              const native = nativeSubagentMetadata(event);
               const safeTask = redactSecrets(event.task, runSecrets);
               const safeProgress = event.progress
                 ? redactSecrets(event.progress, runSecrets)
@@ -6961,6 +6968,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
                 type: "thread.subagent",
                 runId,
                 payload: {
+                  ...native,
                   agentId: event.agentId,
                   name: event.name,
                   task: safeTask,
@@ -6969,7 +6977,41 @@ export function createRunExecutor(deps: ExecutorDeps) {
                   result: safeResult,
                 },
               });
-              if (event.status === "completed" || event.status === "failed") {
+              if (native) {
+                // Persist births and state/result changes so a refreshed client can
+                // rebuild the tree. Token-level progress remains in the event stream.
+                const projectionKey = JSON.stringify([
+                  event.status,
+                  event.name,
+                  safeTask,
+                  safeResult,
+                  native.parentThreadId,
+                  native.nativeStatus,
+                ]);
+                if (nativeProjectionKeys.get(event.agentId) !== projectionKey) {
+                  nativeProjectionKeys.set(event.agentId, projectionKey);
+                  await publishMessage(
+                    deps,
+                    run,
+                    "bot",
+                    [
+                      {
+                        kind: "subagent",
+                        ...native,
+                        agentId: event.agentId,
+                        name: event.name,
+                        task: safeTask,
+                        status: event.status,
+                        progress: safeProgress,
+                        result: safeResult,
+                      },
+                    ],
+                    false,
+                    `codex-node:${runId}:${event.agentId}:${event.nativeRevision ?? 0}`,
+                  );
+                }
+                if (event.status !== "running") publishedTerminalSubagent = true;
+              } else if (event.status === "completed" || event.status === "failed") {
                 publishedTerminalSubagent ||= !subagentMarksUnread(
                   run.trigger,
                   event.status,
@@ -6997,6 +7039,15 @@ export function createRunExecutor(deps: ExecutorDeps) {
                   ),
                 );
               }
+            } else if (event.type === "checkpoint" && codexOwned) {
+              await deps.events.append({
+                spaceId: run.spaceId,
+                threadId: thread.id,
+                botId: bot.id,
+                type: "run.checkpointed",
+                runId,
+                payload: JSON.parse(event.blob),
+              });
             } else if (event.type === "usage" && !event.accounted) {
               await recordUsage(deps.prisma, event, {
                 spaceId: run.spaceId,
@@ -7172,6 +7223,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
               },
             });
             if (
+              !codexOwned &&
               contextStrategy === "current" &&
               shouldEnqueueCompaction(
                 updatedThread.nextMessageSeq,

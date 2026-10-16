@@ -37,6 +37,7 @@ import type { ComposerMention, SlashActionId } from "@rakazo/core";
 import {
   attachmentsForThread,
   buildComposerMentionOptions,
+  buildNativeSessionTrees,
   clampMentionHighlightIndex,
   cronFromPreset,
   formatMessageTime,
@@ -64,6 +65,7 @@ import {
   truncateSlashDescription,
   userVisibleMessages,
   withLiveStreamingProgress,
+  withoutNativeSessionBlocks,
 } from "@rakazo/core";
 import type { GroupAvatarMember } from "@rakazo/ui-web";
 import {
@@ -150,6 +152,7 @@ import { VoiceChatCard } from "../components/call/VoiceChatCard";
 import { ComputerWorkspace } from "../components/computer/ComputerWorkspace";
 import { lazyOverlay } from "../components/ErrorBoundary";
 import { MessageHoverMetadata } from "../components/MessageHoverMetadata";
+import { NativeSessionTrees } from "../components/native-session-tree.js";
 import {
   LIVE_TOOL_STEP_WINDOW,
   StandaloneToolActivity,
@@ -1823,7 +1826,7 @@ export function ShellPage() {
     rememberSeenRunErrorId(runId);
   }, []);
   const transcriptMessages = useMemo(
-    () => userVisibleMessages(activeSnapshot?.messages ?? [], { includePeerReceipts: true }),
+    () => activeSnapshot?.messages ?? [],
     [activeSnapshot?.messages],
   );
   const transcriptArtifactTarget = useMemo<ArtifactTarget>(
@@ -4827,7 +4830,7 @@ export function ShellPage() {
   );
 }
 
-const Transcript = memo(function Transcript({
+export const Transcript = memo(function Transcript({
   scrollRef,
   scrollRequest,
   onScrollRequestHandled,
@@ -4897,7 +4900,14 @@ const Transcript = memo(function Transcript({
     () => new Map(messages.map((message) => [message.id, message])),
     [messages],
   );
-  const reactionView = useMemo(() => projectMessageReactions(messages), [messages]);
+  const reactionView = useMemo(
+    () =>
+      projectMessageReactions(
+        userVisibleMessages(withoutNativeSessionBlocks(messages), { includePeerReceipts: true }),
+      ),
+    [messages],
+  );
+  const nativeTrees = useMemo(() => buildNativeSessionTrees(messages), [messages]);
   const separatorIds = timeSeparatorIds(
     reactionView.visibleMessages.filter((message) =>
       messageHasVisibleBlocks(message.blocks, showToolActivity),
@@ -5104,7 +5114,8 @@ const Transcript = memo(function Transcript({
   );
 
   return (
-    <div className="relative flex min-h-0 flex-1">
+    <div className="relative flex min-h-0 flex-1 flex-col">
+      <NativeSessionTrees trees={nativeTrees} />
       <div
         ref={scrollRef}
         data-testid="transcript"

@@ -21,6 +21,7 @@ import type {
 import {
   applyMessagingOutboundStatus,
   ChatSdkMessagingSurface,
+  CodexAgentRuntime,
   CodexCatalogCache,
   ComposioConnector,
   createBackgroundJobHandlers,
@@ -53,12 +54,10 @@ import {
   McpConnector,
   McpOAuthBroker,
   messagingPlatformsFromEnv,
-  PiAgentRuntime,
   PiOAuthLogins,
   PipedreamConnector,
   PostgresRealtimeFanout,
   pipedreamConfigFromEnv,
-  piSessionsRoot,
   reconcileCloudAgents,
   reconcileComputerUpdates,
   removePiUserSessions,
@@ -384,8 +383,9 @@ export async function createApp(
     runtimeOverride ??
     (env.agentRuntime === "scripted"
       ? new ScriptedAgentRuntime()
-      : new PiAgentRuntime({
-          sessionRoot: env.piSessionRecording ? piSessionsRoot(env.dataDir) : undefined,
+      : new CodexAgentRuntime({
+          sessionRoot: `${env.dataDir}/codex-sessions`,
+          binary: env.codexBinary,
         }));
   const notifications = new ExpoPushProvider(env.dataDir, (sessionId) =>
     pushSessionExpiresAt(prisma, sessionId),
